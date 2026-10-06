@@ -488,7 +488,8 @@ class Agent:
             msgs.pop(0)
         return [{"role": "system", "content": system}] + msgs
 
-    def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None]) -> Tuple[str, str]:
+    def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None],
+              think: Optional[bool] = None) -> Tuple[str, str]:
         progress = ui.Progress(self.cfg.verbose, show_status=False)  # stats are shown once per turn
 
         def tap(piece: str) -> None:
@@ -496,7 +497,7 @@ class Agent:
             progress(piece)
 
         try:
-            res = self.client.chat(messages, on_token=tap)
+            res = self.client.chat(messages, on_token=tap, think=think)
         finally:
             progress.done()
         return res.text, res.finish_reason
@@ -505,9 +506,9 @@ class Agent:
     def chat(self, text: str) -> str:
         self.history.append({"role": "user", "content": text})
         msgs = [{"role": "system", "content": CHAT_SYSTEM.format(language=detect_language(text))}] + self.history[-6:]
-        raw, _ = self._call(msgs, lambda s: None)
+        raw, _ = self._call(msgs, lambda s: None, think=False)
         thinking, visible = split_thinking(raw)
-        reply = visible or raw.strip()
+        reply = visible.strip() or raw.strip()
         self.history.append({"role": "assistant", "content": reply})
         emit("assistant", text=reply)
         return reply

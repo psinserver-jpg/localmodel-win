@@ -204,7 +204,12 @@ class Progress:
         c = STATS.current
         secs = int(time.time() - self._t0)
         toks = c.out_text_tokens if c else 0
-        verb = "생각하는 중…" if c is None or c.first_token is None else "작성 중…"
+        if c is None or c.first_token is None:
+            verb = "준비 중…"  # prompt processing / model loading, not thinking
+        elif self._thinking:
+            verb = "생각하는 중…"
+        else:
+            verb = "작성 중…"
         g = self.GLYPHS[self._n % len(self.GLYPHS)]
         line = "%s %s (%ds · ↓ %s 토큰 · Ctrl+C 로 중지)" % (g, verb, secs, fmt_tokens(toks))
         head, rest = g + " " + verb, line[len(g) + 1 + len(verb):]
@@ -217,7 +222,13 @@ class Progress:
         while not self._stop.wait(0.5):
             self._render()
 
+    _thinking = False
+
     def __call__(self, piece: str) -> None:
+        if "<think>" in piece:
+            self._thinking = True
+        if "</think>" in piece:
+            self._thinking = False
         if self.verbose:
             sys.stdout.write(piece)
             sys.stdout.flush()

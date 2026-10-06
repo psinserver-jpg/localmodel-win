@@ -104,6 +104,7 @@ class ChatClient:
         self.cfg = cfg
         self._stream_usage = True  # ask OpenAI-compatible servers for exact token usage
         self._merge_system = False  # some chat templates (e.g. older Gemma/Mistral) reject a system role
+        self._think: Optional[bool] = None  # per call: False = ask reasoning models not to think
 
     # ------------------------------------------------------------------ public
     def chat(
@@ -112,7 +113,10 @@ class ChatClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         on_token: TokenCallback = None,
+        think: Optional[bool] = None,
     ) -> ChatResult:
+        """think=False asks reasoning models (Qwen3, DeepSeek-R1, …) to answer without thinking."""
+        self._think = think
         temperature = self.cfg.temperature if temperature is None else temperature
         max_tokens = max_tokens or self.cfg.max_output_tokens
         last_err: Optional[Exception] = None
@@ -140,6 +144,10 @@ class ChatClient:
                         r"system|role|conversation roles|alternate", detail, re.I):
                     self._merge_system = True  # template has no system role: fold it into the user turn
                     messages = _merge_system_messages(messages)
+                    last_err = e
+                    continue
+                if e.code in (400, 422) and getattr(self, "_think_kw", True) and self._think is False:
+                    self._think_kw = False  # server rejected the no-thinking switch; retry without it
                     last_err = e
                     continue
                 if e.code in (400, 422) and self._stream_usage:
@@ -205,6 +213,8 @@ class ChatClient:
         }
         if self._stream_usage:
             body["stream_options"] = {"include_usage": True}
+        if getattr(self, "_think", None) is False and getattr(self, "_think_kw", True):
+            body["chat_template_kwargs"] = {"enable_thinking": False}  # vLLM / SGLang / llama.cpp (Qwen3 etc.)
         think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
@@ -258,7 +268,10 @@ class ChatClient:
                 "num_ctx": self.cfg.context_tokens,
                 "num_predict": max_tokens,
             },
+            "keep_alive": "30m",  # keep the model in GPU memory between turns (Ollama unloads after 5 min)
         }
+        if getattr(self, "_think", None) is False and getattr(self, "_think_kw", True):
+            body["think"] = False  # Ollama >= 0.9: reasoning models answer directly
         think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
