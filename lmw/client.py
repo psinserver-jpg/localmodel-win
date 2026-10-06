@@ -52,6 +52,34 @@ def strip_reasoning(text: str) -> str:
     return text.strip("\n")
 
 
+class _ThinkMerger:
+    """Folds a separate reasoning stream into the text as <think>...</think>, so every
+    server/model looks the same downstream (the agent shows it as a collapsible block)."""
+
+    def __init__(self):
+        self.open = False
+
+    def feed(self, thought: str, content: str) -> List[str]:
+        out = []
+        if thought:
+            if not self.open:
+                out.append("<think>")
+                self.open = True
+            out.append(thought)
+        if content:
+            if self.open:
+                out.append("</think>")
+                self.open = False
+            out.append(content)
+        return out
+
+    def close(self) -> List[str]:
+        if self.open:
+            self.open = False
+            return ["</think>"]
+        return []
+
+
 def _peek(err: urllib.error.HTTPError) -> str:
     try:
         body = err.read().decode("utf-8", errors="replace")[:1000]
@@ -177,6 +205,7 @@ class ChatClient:
         }
         if self._stream_usage:
             body["stream_options"] = {"include_usage": True}
+        think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
         usage = None
@@ -206,13 +235,16 @@ class ChatClient:
                     usage = chunk["usage"]
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or choice.get("message") or {}
+                    # reasoning models served by vLLM / LM Studio / SGLang send thinking separately
+                    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
                     piece = delta.get("content") or ""
-                    if piece:
-                        parts.append(piece)
+                    for text in think.feed(thought, piece):
+                        parts.append(text)
                         if on_token:
-                            on_token(piece)
+                            on_token(text)
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
+        parts += think.close()
         return ChatResult("".join(parts), finish, usage)
 
     def _chat_ollama(self, messages, temperature, max_tokens, on_token) -> ChatResult:
@@ -227,6 +259,7 @@ class ChatClient:
                 "num_predict": max_tokens,
             },
         }
+        think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
         usage = None
@@ -241,11 +274,11 @@ class ChatClient:
                     continue
                 if chunk.get("error"):
                     raise ModelError(str(chunk["error"]))
-                piece = (chunk.get("message") or {}).get("content") or ""
-                if piece:
-                    parts.append(piece)
+                msg = chunk.get("message") or {}
+                for text in think.feed(msg.get("thinking") or "", msg.get("content") or ""):
+                    parts.append(text)
                     if on_token:
-                        on_token(piece)
+                        on_token(text)
                 if chunk.get("done"):
                     finish = chunk.get("done_reason") or "stop"
                     if chunk.get("eval_count"):
@@ -255,6 +288,7 @@ class ChatClient:
                             "gen_seconds": (chunk.get("eval_duration") or 0) / 1e9,
                         }
                     break
+        parts += think.close()
         return ChatResult("".join(parts), finish, usage)
 
     def _explain(self, err: Optional[Exception]) -> str:

@@ -109,9 +109,10 @@ def stepper(active: int, detail: str = "") -> None:
 
 def banner(title: str) -> None:
     import re as _re
-    m = _re.match(r"^(\d)/8 [A-Z ]+?(?: — (.*))?$", title)
+    m = _re.match(r"^(\d)/8 ([A-Z ]+?)(?: — (.*))?$", title)
     if m:
-        stepper(int(m.group(1)), m.group(2) or "")
+        from .events import emit  # deep-mode phases become structured events (stepper on the web)
+        emit("phase", index=int(m.group(1)), name=m.group(2).strip(), detail=m.group(3) or "")
         return
     print("\n" + _c("1;36", "▶ " + title), flush=True)
 
@@ -165,9 +166,10 @@ def status_line() -> str:
 
 
 def status(prefix: str = "  ") -> None:
-    """Print the status line once (dim)."""
+    """Print the status line once (dim). Not mirrored as text: the hub gets it as live status."""
     line = prefix + status_line()
-    print(_c("2", line[: _width() - 6]), flush=True)
+    with remote_muted():
+        print(_c("2", line[: _width() - 6]), flush=True)
 
 
 class Progress:
@@ -175,8 +177,9 @@ class Progress:
     the model works, refreshed twice a second. In verbose mode the text streams instead
     and the status line is printed when the answer is complete."""
 
-    def __init__(self, verbose: bool):
+    def __init__(self, verbose: bool, show_status: bool = True):
         self.verbose = verbose
+        self.show_status = show_status
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -210,7 +213,8 @@ class Progress:
                 sys.stdout.flush()
         if self.verbose:
             sys.stdout.write("\n")
-        status("  ✓ ")
+        if self.show_status:
+            status("  ✓ ")
 
 
 # ------------------------------------------------------------- input routing
@@ -227,3 +231,23 @@ def read_line(prompt: str = "") -> str:
     if _input_hook is not None:
         return _input_hook(prompt)
     return input(prompt)
+
+
+# ------------------------------------------------------------- remote mirroring control
+# Text printed inside `remote_muted()` is not copied to the hub as raw terminal output
+# (used for things the website receives as structured events, and for noisy status lines).
+_tls = threading.local()
+
+
+class remote_muted:
+    def __enter__(self):
+        _tls.mute = getattr(_tls, "mute", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _tls.mute = getattr(_tls, "mute", 1) - 1
+        return False
+
+
+def is_remote_muted() -> bool:
+    return getattr(_tls, "mute", 0) > 0

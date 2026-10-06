@@ -10,6 +10,7 @@ Like Claude Code, but built for local models:
 from __future__ import annotations
 
 import difflib
+import threading
 import time
 import re
 import shutil
@@ -34,8 +35,13 @@ except ImportError:
 
 # (command, description, group) — drives /help, the "/" menu and Tab completion
 COMMANDS = [
-    ("/run", "작업 요청 (8단계로 끝까지 완성)", "작업"),
-    ("/ask", "질문하기 (파일을 읽고 답변)", "작업"),
+    ("/run", "에이전트로 작업 (파일 읽기·쓰기·명령)", "작업"),
+    ("/deep", "큰 작업을 8단계로 끝까지 (생각·계획·검토·수정)", "작업"),
+    ("/ask", "질문하기 (읽기만, 변경 없음)", "작업"),
+    ("/new", "새 세션 시작", "작업"),
+    ("/mode", "권한 모드: 매번 묻기 / 편집 자동 수락 / 전체 허용", "설정"),
+    ("/effort", "생각 수준: 자동 / 빠르게 / 보통 / 깊게", "설정"),
+    ("/engine", "에이전트 엔진: lmw / aider", "설정"),
     ("/resume", "중단된 작업 이어하기", "작업"),
     ("/undo", "마지막 작업 되돌리기", "작업"),
     ("/files", "프로젝트 파일 보기", "작업"),
@@ -53,7 +59,6 @@ COMMANDS = [
     ("/stats", "시간 · 토큰 · 속도 통계", "설정"),
     ("/statusline", "상태줄 항목 변경", "설정"),
     ("/config", "현재 설정 보기", "설정"),
-    ("/clear", "대화 기록 지우기", "설정"),
     ("/watch", "다른 컴퓨터의 lmw 화면 보기·조작", "계정"),
     ("/web", "이 화면을 웹에서 보는 주소", "계정"),
     ("/logout", "로그아웃", "계정"),
@@ -71,6 +76,16 @@ HOME = [
     ("전체 명령 보기", "", "/"),
     ("종료", "", "/exit"),
 ]
+
+
+CTL_PREFIX = "\x00ctl:"
+PERM_PREFIX = "\x00perm:"
+MODE_LABELS = {"ask": "매번 묻기", "auto-edit": "편집 자동 수락", "full": "전체 허용"}
+MODE_HINTS = {"ask": "파일 수정·명령 실행 전에 물어봄", "auto-edit": "파일 수정은 바로, 명령은 물어봄",
+              "full": "모두 바로 실행 (위험한 명령만 물어봄)"}
+EFFORT_LABELS = {"auto": "자동", "low": "빠르게", "medium": "보통", "high": "깊게"}
+EFFORT_HINTS = {"auto": "요청 크기에 맞춰 자동 선택", "low": "최소한으로 생각", "medium": "필요할 때만 생각",
+                "high": "큰 작업은 8단계(생각·계획·검토)로"}
 
 
 def _setup_completion() -> None:
@@ -118,6 +133,14 @@ class Shell:
         self.done_tasks: List[str] = []  # earlier task requests this session
         self.last_run: Optional[Pipeline] = None
         self.client = ChatClient(cfg)
+        from .agent import Permissions
+        self.perms = Permissions(getattr(cfg, "permission_mode", "ask"))
+        self.effort = getattr(cfg, "effort", "auto")
+        self.engine = "lmw"  # or "aider"
+        self.stop_event = threading.Event()
+        self.pending: List[str] = []  # prompts that arrived while busy (e.g. typed on the web)
+        self.agent = None
+        self.titled = False
 
     # ------------------------------------------------------------------ main
     bridge = None
@@ -138,7 +161,10 @@ class Shell:
         if not self.auth or self.bridge:
             return
         try:
-            self.bridge = Bridge(self.auth, "lmw", str(self.root), self.cfg.model)
+            self.bridge = Bridge(self.auth, "lmw", str(self.root), self.cfg.model,
+                                 mode=self.perms.mode, effort=self.effort)
+            self.bridge.on_interrupt = self.stop_event.set
+            self.bridge.on_control = self._remote_control
         except Exception as e:
             ui.warn("Hub 연결 실패 (%s) — 이 컴퓨터에서만 작업합니다" % e)
             return
@@ -187,15 +213,25 @@ class Shell:
     def _loop(self) -> int:
         while True:
             try:
-                print()
-                ui.status()
-                line = ui.read_line(ui.prompt_label("lmw") + " ").strip()
+                if self.pending:
+                    line = self.pending.pop(0).strip()
+                    print(ui.prompt_label("lmw") + " " + line + ui.dim("   [대기열]"))
+                else:
+                    print()
+                    ui.status()
+                    line = ui.read_line(ui.prompt_label("lmw") + " ").strip()
             except EOFError:
                 print()
                 return 0
             except KeyboardInterrupt:
                 print()
                 continue
+            if line.startswith(CTL_PREFIX):
+                if line[len(CTL_PREFIX):] == "new_session":
+                    self.new_session()
+                continue
+            if line.startswith(PERM_PREFIX):
+                continue  # a late permission click; nothing is waiting for it
             if not line:
                 line = self.home_menu() or ""
             elif line == "/":
@@ -212,10 +248,8 @@ class Shell:
                 if line.startswith("/"):
                     if self._command(line) == "exit":
                         return 0
-                elif self._is_question(line):
-                    self.ask(line)
                 else:
-                    self.task(line)
+                    self.handle(line)
             except KeyboardInterrupt:
                 ui.warn("중단됨 — /resume 으로 이어서 할 수 있습니다")
             except ModelError as e:
@@ -262,10 +296,40 @@ class Shell:
             return "exit"
         if cmd in ("/help", "/h", "/?"):
             self._help()
+        elif cmd == "/mode":
+            if arg in MODE_LABELS:
+                self._remote_control("mode", arg)
+            else:
+                i = ui.menu("권한 모드", [(MODE_LABELS[m], MODE_HINTS[m]) for m in MODE_LABELS],
+                            list(MODE_LABELS).index(self.perms.mode))
+                if i >= 0:
+                    self._remote_control("mode", list(MODE_LABELS)[i])
+        elif cmd == "/effort":
+            if arg in EFFORT_LABELS:
+                self._remote_control("effort", arg)
+            else:
+                i = ui.menu("생각 수준", [(EFFORT_LABELS[m], EFFORT_HINTS[m]) for m in EFFORT_LABELS],
+                            list(EFFORT_LABELS).index(self.effort))
+                if i >= 0:
+                    self._remote_control("effort", list(EFFORT_LABELS)[i])
+        elif cmd in ("/new", "/clear"):
+            self.new_session()
+        elif cmd == "/deep":
+            self.handle(arg, route_override="deep") if arg else ui.warn("사용법: /deep <요청>")
+        elif cmd == "/engine":
+            from .agent import aider_available
+            if arg in ("lmw", "aider"):
+                if arg == "aider" and not aider_available():
+                    ui.warn("Aider 가 없습니다:  pip install aider-chat")
+                else:
+                    self.engine = arg
+                    ui.ok("에이전트 엔진: %s" % arg)
+            else:
+                ui.info("현재 엔진: %s   (/engine lmw | /engine aider)" % self.engine)
         elif cmd == "/ask":
-            self.ask(arg) if arg else ui.warn("사용법: /ask <질문>")
+            self.handle(arg, route_override="agent", readonly=True) if arg else ui.warn("사용법: /ask <질문>")
         elif cmd == "/run":
-            self.task(arg) if arg else ui.warn("사용법: /run <요청>")
+            self.handle(arg, route_override="agent") if arg else ui.warn("사용법: /run <요청>")
         elif cmd == "/resume":
             self.resume(arg or None)
         elif cmd == "/check":
@@ -358,15 +422,113 @@ class Shell:
         elif cmd == "/config":
             for k, v in self.cfg.to_dict().items():
                 print("   %-20s %s" % (k, v))
-        elif cmd == "/clear":
-            self.chat.clear()
-            self.done_tasks.clear()
-            ui.ok("대화 기록을 지웠습니다")
         else:
             ui.warn("알 수 없는 명령: %s  (/help)" % cmd)
         return None
 
     # ----------------------------------------------------------------- task
+    # ------------------------------------------------------------- agent turn
+    def _get_agent(self):
+        from .agent import Agent
+        if self.agent is None:
+            self.agent = Agent(self.cfg, self.root, self.client, self.ask_permission, self.perms, self.stop_event)
+        return self.agent
+
+    def handle(self, text: str, route_override: Optional[str] = None, readonly: bool = False) -> None:
+        """One user turn: route by effort, run, and report — like a chat app turn."""
+        from .agent import Interrupted, route, run_aider, turn_stats
+        from .events import emit
+        from .stats import STATS
+        emit("user", text=text)
+        kind = route_override or route(text, self.effort)
+        if self.bridge and not self.titled:
+            self.bridge.set_meta(title=text.strip().replace("\n", " ")[:60])
+            self.titled = kind != "chat"  # small talk is only a placeholder title
+        if kind == "agent" and self.engine == "aider" and not readonly:
+            kind = "aider"
+        self.stop_event.clear()
+        if self.bridge:
+            self.bridge.running = True
+        t0, tin, tout = time.time(), STATS.prompt_tokens, STATS.output_tokens
+        try:
+            if kind == "chat":
+                self._get_agent().chat(text)
+            elif kind == "deep":
+                emit("notice", level="info", text="큰 작업이라 깊게 진행합니다 (생각 → 계획 → 구현 → 검토·수정)")
+                self.task(text)
+            elif kind == "aider":
+                if self.perms.mode == "ask" and self.ask_permission({
+                        "id": "paider%d" % int(t0), "tool": "aider", "title": "Aider 로 이 폴더의 파일 수정",
+                        "detail": str(self.root), "danger": False}) == "deny":
+                    emit("notice", level="warn", text="취소했습니다")
+                else:
+                    run_aider(self.cfg, self.root, text, self.stop_event)
+            else:
+                self._get_agent().run(text, self.effort, readonly=readonly)
+        except (Interrupted, KeyboardInterrupt):
+            emit("notice", level="warn", text="중지했습니다")
+        except ModelError as e:
+            emit("error", text=str(e))
+        finally:
+            if self.bridge:
+                self.bridge.running = False
+            emit("turn_end", stats=turn_stats(t0, tin, tout))
+
+    def ask_permission(self, req: Dict) -> str:
+        """Ask the user (terminal or website) before an important action. Returns allow/always/deny."""
+        from .events import emit
+        emit("permission", **req)
+        answers = {"y": "allow", "yes": "allow", "": "allow", "ㅛ": "allow", "a": "always", "ㅁ": "always",
+                   "always": "always", "n": "deny", "no": "deny", "ㅜ": "deny"}
+        while True:
+            try:
+                line = ui.read_line(ui.yellow("  허용할까요? [Y]es / [a]lways / [n]o > "))
+            except EOFError:
+                line = "n"
+            by = "terminal"
+            if line.startswith(PERM_PREFIX):
+                pid, _, decision = line[len(PERM_PREFIX):].partition(":")
+                if pid != req["id"] or decision not in ("allow", "always", "deny"):
+                    continue
+                by = "web"
+            elif line.startswith(CTL_PREFIX):
+                self.pending.append(line)
+                continue
+            elif line.strip().lower() in answers:
+                decision = answers[line.strip().lower()]
+            else:
+                self.pending.append(line)  # a new prompt typed while waiting: run it afterwards
+                ui.info(ui.dim("(요청을 대기열에 넣었습니다 — 먼저 위 권한에 답해 주세요)"))
+                continue
+            emit("permission_result", id=req["id"], decision=decision, by=by)
+            return decision
+
+    def _remote_control(self, action: str, value: str) -> None:
+        from .events import emit
+        if action == "mode" and value in ("ask", "auto-edit", "full"):
+            self.perms.mode = value
+            if self.bridge:
+                self.bridge.set_meta(mode=value)
+            emit("notice", level="info", text="권한 모드: %s" % MODE_LABELS[value])
+        elif action == "effort" and value in ("auto", "low", "medium", "high"):
+            self.effort = value
+            if self.bridge:
+                self.bridge.set_meta(effort=value)
+            emit("notice", level="info", text="생각 수준: %s" % EFFORT_LABELS[value])
+
+    def new_session(self) -> None:
+        from .events import emit
+        self.agent = None
+        self.chat.clear()
+        self.done_tasks.clear()
+        self.titled = False
+        if self.bridge:
+            try:
+                self.bridge.new_session()
+            except Exception as e:
+                ui.warn("새 세션을 Hub 에 만들지 못했습니다: %s" % e)
+        emit("notice", level="info", text="새 세션을 시작했습니다")
+
     def task(self, request: str) -> None:
         ctx = "\n".join("- " + t for t in self.done_tasks[-5:])
         pipe = Pipeline(self.cfg, self.root, request=request, client=self.client,
@@ -374,6 +536,11 @@ class Shell:
         self.last_run = pipe
         state = pipe.run()
         self.done_tasks.append(request.strip().replace("\n", " ")[:300])
+        report = pipe.run_dir / "REPORT.md"
+        if report.is_file():
+            from .events import BUS
+            for sink in list(BUS.sinks):  # the report is already printed in the terminal
+                sink({"type": "assistant", "text": report.read_text(encoding="utf-8"), "ts": time.time()})
         if state.get("status") == "done":
             ui.ok("완료 — 이어서 수정 요청을 하거나 /undo 로 되돌릴 수 있습니다")
         else:
@@ -403,7 +570,7 @@ class Shell:
             return ""
 
     def _approve(self, blocks: List[FileBlock]) -> List[FileBlock]:
-        if self.auto:
+        if self.auto or self.perms.mode in ("auto-edit", "full") or "edit" in self.perms.always:
             return blocks
         ws = Workspace(self.root)
         accepted = []

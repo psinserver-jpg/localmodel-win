@@ -205,6 +205,7 @@ def watch(auth: Dict[str, str], exclude: str = "") -> int:
     stop = threading.Event()
 
     def pump():
+        from .events import render
         seq = 0
         while not stop.is_set():
             try:
@@ -213,15 +214,14 @@ def watch(auth: Dict[str, str], exclude: str = "") -> int:
             except (urllib.error.URLError, OSError):
                 stop.wait(2)
                 continue
-            if ev.get("base", 0) > seq:
-                sys.stdout.write(ui.dim("[… 이전 출력 생략 …]\n"))
-            if ev["events"]:
-                sys.stdout.write("\r\033[K")
-                for text in ev["events"]:
-                    sys.stdout.write(text)
-                if ev["session"].get("prompt"):
-                    sys.stdout.write(ev["session"]["prompt"] + " ")
-                sys.stdout.flush()
+            for e in ev["events"]:
+                if e.get("type") == "log":
+                    sys.stdout.write(ui.dim(str(e.get("text", ""))) + "\n")
+                elif e.get("type") == "user":
+                    sys.stdout.write(ui.bold("> ") + str(e.get("text", "")) + "\n")
+                else:
+                    render(e)
+            sys.stdout.flush()
             seq = ev["next"]
             if not ev["session"]["alive"]:
                 ui.info("그 컴퓨터의 lmw 가 종료되었습니다 (Enter 로 돌아가기)")
@@ -234,7 +234,7 @@ def watch(auth: Dict[str, str], exclude: str = "") -> int:
             line = ui.read_line("")  # shares stdin with the bridge's keyboard reader
             if stop.is_set() or line.strip() == "/detach":
                 break
-            _req("POST", "%s/api/sessions/%s/input" % (hub, s["id"]), {"text": line}, auth["token"])
+            _req("POST", "%s/api/sessions/%s/input" % (hub, s["id"]), {"kind": "prompt", "text": line}, auth["token"])
     except (EOFError, KeyboardInterrupt):
         pass
     stop.set()
@@ -282,7 +282,8 @@ class _Tee:
         self._bridge = bridge
 
     def write(self, s):
-        self._bridge.capture(s)
+        if not ui.is_remote_muted():
+            self._bridge.capture(s)
         return self._real.write(s)
 
     def flush(self):
@@ -292,84 +293,144 @@ class _Tee:
         return getattr(self._real, name)
 
 
+PERM = "\x00perm:"  # inbox sentinels understood by the shell
+CTL = "\x00ctl:"
+
+
 class Bridge:
-    def __init__(self, auth: Dict[str, str], name: str, cwd: str, model: str):
+    """Mirrors this lmw session to the user's Hub account (always on while logged in).
+
+    - structured events (from events.BUS) + raw terminal output (as "log" events) go up
+    - prompts, permission answers and controls typed on the website come down
+    """
+
+    def __init__(self, auth: Dict[str, str], name: str, cwd: str, model: str,
+                 mode: str = "ask", effort: str = "auto"):
         self.relay = (auth.get("relay") or auth["hub"]).rstrip("/")
         self.token = auth["token"]
         self.email = auth.get("user") or auth.get("email", "")
-        self.inbox: "queue.Queue[str]" = queue.Queue()
-        self._out: List[str] = []
+        self.inbox: "queue.Queue" = queue.Queue()
+        self.cwd, self.model, self.mode, self.effort = cwd, model, mode, effort
+        self.device = "%s:%d" % (socket.gethostname(), os.getpid())
+        self._events: List[Dict] = []
+        self._log: List[str] = []
+        self._meta: Dict[str, object] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._prompt = ""
-        self._pending_line = ""  # text after the last \r or \n (status line redraws)
+        self._pending_line = ""
+        self.running = False
+        self.on_interrupt = lambda: None
+        self.on_control = lambda action, value: None
         self.session_id = ""
-        _, d = _req("POST", self.relay + "/api/sessions", {
-            "name": name, "host": socket.gethostname(), "cwd": cwd, "model": model}, self.token)
-        self.session_id = d["id"]
+        self.new_session()
         self._orig_out, self._orig_err = sys.stdout, sys.stderr
 
     @property
     def url(self) -> str:
         return self.relay + "/"
 
+    def new_session(self, title: str = "") -> str:
+        self.flush()
+        _, d = _req("POST", self.relay + "/api/sessions", {
+            "host": socket.gethostname(), "cwd": self.cwd, "model": self.model, "title": title,
+            "mode": self.mode, "effort": self.effort, "device": self.device}, self.token)
+        with self._lock:
+            self.session_id = d["id"]
+            self._events, self._log = [], []
+        return self.session_id
+
     # ------------------------------------------------------------- output
+    def event(self, e: Dict) -> None:
+        """events.BUS sink."""
+        with self._lock:
+            self._flush_log_locked()
+            self._events.append(dict(e))
+
+    def set_meta(self, **kw) -> None:
+        with self._lock:
+            self._meta.update({k: v for k, v in kw.items() if v is not None})
+            if "mode" in kw:
+                self.mode = kw["mode"]
+            if "effort" in kw:
+                self.effort = kw["effort"]
+
     def capture(self, s: str) -> None:
         if not s:
             return
         with self._lock:
-            # Carriage-return redraws (live status line) are not appended to the log;
-            # the latest one is sent as the session status instead.
             text = self._pending_line + s
             lines = text.split("\n")
             self._pending_line = lines.pop()
             for line in lines:
                 if "\r" in line:
                     line = line.rsplit("\r", 1)[-1]
-                self._out.append(_ANSI.sub("", line) + "\n")
+                self._log.append(_ANSI.sub("", line))
             if "\r" in self._pending_line:
                 self._pending_line = self._pending_line.rsplit("\r", 1)[-1]
 
-    def _flush_loop(self) -> None:
-        from .stats import STATS
-        last_status = None
-        while not self._stop.wait(0.4):
-            self._push(STATS.line(), last_status)
-            last_status = STATS.line()
+    def _flush_log_locked(self) -> None:
+        lines = [l for l in self._log if l.strip()]
+        if lines:
+            self._events.append({"type": "log", "text": "\n".join(lines), "ts": time.time()})
+        self._log = []
 
-    def _push(self, status: str, last_status: Optional[str], ended: bool = False) -> None:
+    def flush(self, ended: bool = False) -> None:
+        from .stats import STATS
+        if not self.session_id:
+            return
         with self._lock:
-            out, self._out = self._out, []
-            partial = self._pending_line
-        body: Dict[str, object] = {}
-        if out:
-            body["output"] = ["".join(out)]
-        if status != last_status:
-            body["status"] = status
-        prompt = _ANSI.sub("", partial).strip() if partial else ""
-        if prompt != self._prompt:
-            body["prompt"] = prompt
-            self._prompt = prompt
+            self._flush_log_locked()
+            events, self._events = self._events, []
+            meta, self._meta = self._meta, {}
+            sid = self.session_id
+        body: Dict[str, object] = dict(meta)
+        body.update(events=events, status=STATS.line(), prompt=self._prompt, running=self.running, device=self.device)
         if ended:
             body["ended"] = True
-        if not body:
-            return
         try:
-            _req("POST", "%s/api/sessions/%s/events" % (self.relay, self.session_id), body, self.token, timeout=15)
+            _req("POST", "%s/api/sessions/%s/events" % (self.relay, sid), body, self.token, timeout=15)
         except (urllib.error.URLError, OSError):
-            with self._lock:  # keep the output and retry next tick
-                self._out = out + self._out
+            with self._lock:  # keep and retry next tick
+                if sid == self.session_id:
+                    self._events = events + self._events
+                    self._meta = dict(meta, **self._meta)
+
+    def _flush_loop(self) -> None:
+        last = None
+        while not self._stop.wait(0.4):
+            from .stats import STATS
+            state = (STATS.line(), self._prompt, self.running)
+            with self._lock:
+                pending = bool(self._events or self._log or self._meta)
+            if pending or state != last:
+                self.flush()
+                last = state
 
     # -------------------------------------------------------------- input
     def _input_loop(self) -> None:
-        url = "%s/api/sessions/%s/input" % (self.relay, self.session_id)
         while not self._stop.is_set():
+            sid = self.session_id
             try:
-                _, d = _req("GET", url, token=self.token, timeout=35)
-                for text in d.get("input") or []:
-                    self.inbox.put(("web", text))
+                _, d = _req("GET", "%s/api/sessions/%s/input" % (self.relay, sid), token=self.token, timeout=35)
             except (urllib.error.URLError, OSError):
                 self._stop.wait(3)
+                continue
+            for msg in d.get("input") or []:
+                if isinstance(msg, str):  # older hubs
+                    msg = {"kind": "prompt", "text": msg}
+                if msg.get("kind") == "prompt":
+                    self.inbox.put(("web", str(msg.get("text", ""))))
+                    continue
+                action, value = msg.get("action"), msg.get("value", "")
+                if action == "interrupt":
+                    self.on_interrupt()
+                elif action in ("mode", "effort"):
+                    self.on_control(action, value)
+                elif action == "permission":
+                    self.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
+                elif action == "new_session":
+                    self.inbox.put(("web", CTL + "new_session"))
 
     def _keyboard_loop(self) -> None:
         while not self._stop.is_set():
@@ -380,30 +441,38 @@ class Bridge:
             self.inbox.put(("key", line.rstrip("\r\n")))
 
     def read_line(self, prompt: str = "") -> str:
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-        source, text = self.inbox.get()
+        with ui.remote_muted():
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+        self._prompt = _ANSI.sub("", prompt).strip()
+        try:
+            source, text = self.inbox.get()
+        finally:
+            self._prompt = ""
         if source == "eof":
             raise EOFError
-        if source == "web":
-            sys.stdout.write(text + "   " + ui.bold("[원격]") + "\n")  # echo so both sides see it
-            sys.stdout.flush()
-        else:
-            self.capture(text + "\n")  # keyboard echo is done by the terminal; mirror it to the web
+        if source == "web" and not text.startswith("\x00"):
+            with ui.remote_muted():
+                sys.stdout.write(text + "   " + ui.dim("[원격]") + "\n")
+                sys.stdout.flush()
         return text
 
     # ---------------------------------------------------------- lifecycle
     def start(self, keyboard: bool = True) -> None:
+        from .events import BUS
         sys.stdout = _Tee(self._orig_out, self)
         sys.stderr = _Tee(self._orig_err, self)
         ui.set_input_hook(self.read_line)
+        BUS.subscribe(self.event)
         targets = [self._flush_loop, self._input_loop] + ([self._keyboard_loop] if keyboard else [])
         for target in targets:
             threading.Thread(target=target, daemon=True).start()
 
     def stop(self) -> None:
-        from .stats import STATS
+        from .events import BUS
+        BUS.unsubscribe(self.event)
         self._stop.set()
         ui.set_input_hook(None)
         sys.stdout, sys.stderr = self._orig_out, self._orig_err
-        self._push(STATS.line(), None, ended=True)
+        self.running = False
+        self.flush(ended=True)

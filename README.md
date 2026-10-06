@@ -31,17 +31,34 @@ lmw ❯ 카페 홈페이지 만들어줘. 메뉴, 위치, 예약 버튼 포함
 
 ## 3. 쓰는 법
 
-| 하고 싶은 것 | 방법 |
-|---|---|
-| 만들기 / 고치기 | 그냥 입력 |
-| 질문 | 끝에 `?` |
-| 메뉴 | `Enter` |
-| 전체 명령 | `/` (Tab 자동완성) |
-| 되돌리기 | `/undo` |
-| 모델 바꾸기 | `/model` |
-| 밖에서 보기 | [psin.ai.kr](https://psin.ai.kr)에 같은 Google 계정으로 로그인, 또는 다른 PC에서 `lmw watch` |
+그냥 말하듯 입력하면 됩니다. lmw 가 알아서 파일을 **찾고(Grep·Glob) → 읽고(Read) → 고치고(Edit·Write) → 실행해서 확인(Bash)** 합니다.
 
-파일을 바꾸기 전에 항상 물어봅니다 (`y` 승인 · `n` 거절 · `d` 변경 보기 · `a` 모두 승인).
+```
+lmw ❯ calc.py 의 add 버그 고쳐줘
+✻ 생각함 (1.2초)
+● Grep(def add)        ⎿ 1개 일치
+● Read(calc.py)        ⎿ 4줄 읽음
+● Edit(calc.py)        ⎿ +1 −1
+● Bash(python calc.py) ⎿ exit 0
+고쳤습니다. add 가 이제 더하기를 합니다.
+```
+
+| 상황 | 동작 |
+|---|---|
+| "안녕" 같은 짧은 말 | 생각 없이 바로 답변 |
+| 일반 요청 | 에이전트 (필요할 때만 생각) |
+| "홈페이지 만들어줘" 같은 큰 작업 | 8단계 (생각 → 계획 → 구현 → 검토·수정 반복) |
+
+| 명령 | 설명 |
+|---|---|
+| `/mode` | 권한: **매번 묻기** · **편집 자동 수락** · **전체 허용** (위험한 명령은 항상 물어봄) |
+| `/effort` | 생각 수준: 자동 · 빠르게 · 보통 · 깊게 |
+| `/new` | 새 세션 |
+| `/undo` · `/model` | 되돌리기 · 모델 바꾸기 |
+| `Enter` · `/` | 메뉴 · 전체 명령 |
+
+파일 수정·명령 실행 전에는 물어봅니다: `y` 허용 · `a` 항상 허용 · `n` 거부.
+[psin.ai.kr](https://psin.ai.kr) 에 같은 Google 계정으로 로그인하면 세션별 대화, 생각/작업 펼쳐보기, 권한 승인, 프롬프트 보내기를 폰에서도 할 수 있습니다.
 
 ## 준비물
 
@@ -53,7 +70,8 @@ lmw ❯ 카페 홈페이지 만들어줘. 메뉴, 위치, 예약 버튼 포함
 <details>
 <summary>고급 기능</summary>
 
-- `lmw run "요청" -w 폴더` — 대화 없이 한 번에 실행 · `--check "pytest -q"` 테스트 통과까지 강제
+- `lmw run "요청" -w 폴더` — 대화 없이 8단계로 한 번에 실행 · `--check "pytest -q"` 테스트 통과까지 강제
+- 검색은 [ripgrep](https://github.com/BurntSushi/ripgrep) 이 있으면 자동 사용 · `/engine aider` 로 [Aider](https://github.com/Aider-AI/aider) 엔진 사용 가능 (`pip install aider-chat`)
 - `lmw export` — 채팅 앱(Open WebUI 등)용 시스템 프롬프트 · `lmw commands` — `/lmw` 슬래시 명령 파일
 - `lmw ssh user@서버` — 다른 컴퓨터에서 실행 · `lmw tunnel user@서버` — 다른 PC의 GPU 모델 사용
 - `skills/` — 웹 디자인·코딩·디버깅 스킬 (SKILL.md 형식, 직접 추가 가능) · `prompts/` — 단계별 프롬프트
