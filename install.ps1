@@ -1,7 +1,9 @@
-# LMW installer for Windows.  One line in PowerShell:
-#   irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex
+# LMW installer for Windows.
+#   PowerShell:  irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex
+#   cmd:         powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex"
 # Then open a NEW terminal and type:  lmw
 $ErrorActionPreference = "Stop"
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 $Repo   = "psinserver-jpg/localmodel-win"
 $Branch = if ($env:LMW_BRANCH) { $env:LMW_BRANCH } else { "main" }
 $Dest   = Join-Path $env:LOCALAPPDATA "lmw"
@@ -17,14 +19,21 @@ foreach ($c in @("py -3", "python", "python3")) {
 }
 if (-not $py) {
     Write-Host "  Python 이 없어 설치합니다 (winget)…" -ForegroundColor Yellow
-    winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements | Out-Null
+    try {
+        winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements | Out-Null
+    } catch {
+        Write-Host "  ✘ Python 자동 설치 실패. https://www.python.org/downloads/ 에서 설치 후 다시 실행하세요" -ForegroundColor Red
+        Write-Host "    (설치할 때 'Add python.exe to PATH' 체크)" -ForegroundColor Red
+        return
+    }
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
     $py = "py -3"
 }
 
 # 2) Download (git if available, otherwise a zip — no git needed)
 New-Item -ItemType Directory -Force -Path $Dest, $Bin | Out-Null
-if (Test-Path (Join-Path $PSScriptRoot "lmw\__main__.py") -ErrorAction SilentlyContinue) {
+# $PSScriptRoot is empty when piped through `irm | iex`
+if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "lmw\__main__.py"))) {
     $App = $PSScriptRoot   # running from a cloned folder: use it in place
 } elseif (Get-Command git -ErrorAction SilentlyContinue) {
     if (Test-Path (Join-Path $App ".git")) { git -C $App pull -q origin $Branch } else { git clone -q -b $Branch "https://github.com/$Repo.git" $App }
@@ -47,4 +56,4 @@ if (-not (($userPath -split ";") -contains $Bin)) {
 $env:Path += ";$Bin"
 
 Write-Host "  ✔ 설치 완료!" -ForegroundColor Green
-Write-Host "  새 터미널을 열고  lmw  를 입력하세요 (처음 실행 시 로그인 → 모델 설정)." -ForegroundColor Green
+Write-Host "  새 터미널(cmd 또는 PowerShell)을 열고  lmw  를 입력하세요 (처음 실행 시 Google 로그인 → 모델 설정)." -ForegroundColor Green

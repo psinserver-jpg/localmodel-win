@@ -5,9 +5,9 @@
 
 ## 1. 설치 (한 줄)
 
-**Windows** (PowerShell)
-```powershell
-irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex
+**Windows** — 명령 프롬프트(cmd) 또는 PowerShell 어디서나
+```bat
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex"
 ```
 **macOS / Linux**
 ```bash
