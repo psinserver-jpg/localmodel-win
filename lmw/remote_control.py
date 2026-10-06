@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -34,7 +35,56 @@ def _user_agent() -> str:
     return "lmw-cli/%s (%s %s; Python %s)" % (__version__, platform.system(), platform.release(), platform.python_version())
 
 
+_DOH_HOSTS: Dict[str, str] = {}  # hostname -> IP found via DNS-over-HTTPS
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo(host, *args, **kw):
+    ip = _DOH_HOSTS.get(str(host).lower()) if isinstance(host, str) else None
+    return _real_getaddrinfo(ip or host, *args, **kw)
+
+
+def _doh_lookup(host: str) -> Optional[str]:
+    """Resolve without the computer's DNS (a stale ISP cache can break the hub's name for hours)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    for url in ("https://1.1.1.1/dns-query?name=%s&type=A" % host,
+                "https://8.8.8.8/resolve?name=%s&type=A" % host):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/dns-json", "User-Agent": _user_agent()})
+            with urllib.request.urlopen(req, timeout=6, context=ctx) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            for a in d.get("Answer") or []:
+                if a.get("type") == 1 and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", str(a.get("data", ""))):
+                    return a["data"]
+        except Exception:
+            continue
+    return None
+
+
+def _dns_fallback(url: str) -> bool:
+    """True if the URL's host could be resolved another way (then retry the request)."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not host or host in _DOH_HOSTS or re.fullmatch(r"[\d.]+", host):
+        return False
+    ip = _doh_lookup(host)
+    if not ip:
+        return False
+    _DOH_HOSTS[host] = ip
+    socket.getaddrinfo = _getaddrinfo  # TLS still checks the real hostname; only the lookup changes
+    return True
+
+
 def _req(method: str, url: str, body: Optional[dict] = None, token: str = "", timeout: float = 30):
+    try:
+        return _req1(method, url, body, token, timeout)
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), socket.gaierror) and _dns_fallback(url):
+            return _req1(method, url, body, token, timeout)
+        raise
+
+
+def _req1(method: str, url: str, body: Optional[dict] = None, token: str = "", timeout: float = 30):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _user_agent()}
     if token:
