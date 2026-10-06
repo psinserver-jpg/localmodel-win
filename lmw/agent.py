@@ -78,11 +78,7 @@ def route(text: str, effort: str) -> str:
     t = text.strip()
     if _SMALLTALK.match(t) or (len(t) <= 12 and not _TECH.search(t)):
         return "chat"
-    if effort == "high" and (_BUILD_VERB.search(t) or len(t) > 200):
-        return "deep"
-    if effort == "auto" and _BUILD_VERB.search(t) and _BUILD_NOUN.search(t) and len(t) >= 12:
-        return "deep"
-    return "agent"
+    return "agent"  # the step-by-step plan mode runs only when asked: /plan (/계획)
 
 
 # -------------------------------------------------------------- permissions

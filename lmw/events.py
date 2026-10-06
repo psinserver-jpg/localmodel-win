@@ -174,7 +174,9 @@ def render(e: Event, verbose: bool = False) -> None:
         by = {"web": " · 웹", "auto": " · 자동", "terminal": ""}.get(str(e.get("by")), "")
         print("  ⎿  " + (ui.red(word + by) if d == "deny" else ui.dim(word + by)))
     elif t == "phase":
-        ui.stepper(int(e.get("index", 0) or 0), str(e.get("detail", "")))
+        i = int(e.get("index", 0) or 0)
+        if 1 <= i <= len(ui.PHASES):  # one quiet line per stage; no per-phase thinking/details
+            print(ui.dim("  ◆ %d/%d %s" % (i, len(ui.PHASES), ui.PHASES[i - 1][1])))
     elif t == "notice":
         level = e.get("level")
         text = str(e.get("text", ""))

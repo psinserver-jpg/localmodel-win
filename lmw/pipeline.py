@@ -63,6 +63,7 @@ class Pipeline:
         session_context: str = "",
     ):
         self.cfg = cfg
+        self.quiet = False  # chat shell: no per-phase details, only the result
         self.client = client or ChatClient(cfg)
         self.templates = Templates(cfg.resolved_prompts_dir())
         self.all_skills = load_skills(cfg.resolved_skills_dir())
@@ -187,7 +188,7 @@ class Pipeline:
         base = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
         used = estimate_tokens(system) + estimate_tokens(prompt)
         if used > self.cfg.context_tokens - self.cfg.max_output_tokens:
-            ui.warn("prompt (~%d tokens) is close to the context limit (%d)" % (used, self.cfg.context_tokens))
+            self._warn("prompt (~%d tokens) is close to the context limit (%d)" % (used, self.cfg.context_tokens))
         text = ""
         for attempt in range(self.cfg.max_continuations + 1):
             messages = base
@@ -197,7 +198,7 @@ class Pipeline:
                     {"role": "assistant", "content": tail},
                     {"role": "user", "content": self.templates.get("continue")},
                 ]
-            progress = ui.Progress(self.cfg.verbose)
+            progress = ui.Progress(self.cfg.verbose, show_status=not self.quiet)
             res: ChatResult = self.client.chat(messages, temperature=temperature, on_token=progress)
             progress.done()
             text = _merge_continuation(text, strip_reasoning(res.text))
@@ -205,7 +206,7 @@ class Pipeline:
             if not res.truncated and (not unclosed or attempt >= 1):
                 break
             if attempt < self.cfg.max_continuations:
-                ui.info("answer was cut off — asking the model to continue (%d)" % (attempt + 1))
+                self._info("answer was cut off — asking the model to continue (%d)" % (attempt + 1))
         self._log(stage, prompt, text)
         self.save()
         return text
@@ -241,13 +242,21 @@ class Pipeline:
             "review": self.stage_review,
             "final": self.stage_final,
         }
-        ui.info("run: %s   workspace: %s" % (self.state["run_id"], self.ws.root))
-        ui.info("model: %s (%s)   context: %d tokens" % (self.cfg.model, self.cfg.provider, self.cfg.context_tokens))
-        ui.info("skills: " + ", ".join(s.name for s in self.skills))
+        self._info("run: %s   workspace: %s" % (self.state["run_id"], self.ws.root))
+        self._info("model: %s (%s)   context: %d tokens" % (self.cfg.model, self.cfg.provider, self.cfg.context_tokens))
+        self._info("skills: " + ", ".join(s.name for s in self.skills))
         while self.state["stage"] != "done":
             stage_fns[self.state["stage"]]()
             self.save()
         return self.state
+
+    def _info(self, msg: str) -> None:
+        if not self.quiet:
+            ui.info(msg)
+
+    def _warn(self, msg: str) -> None:
+        if not self.quiet:
+            ui.warn(msg)
 
     def _goto(self, stage: str) -> None:
         self.state["stage"] = stage
@@ -286,7 +295,7 @@ class Pipeline:
         }, self.cfg.input_budget())
         out = self.call("review_analysis", prompt)
         if not get_section(out, "acceptance criteria"):
-            ui.warn("review did not return a full analysis; keeping the draft")
+            self._warn("review did not return a full analysis; keeping the draft")
             out = self.state["analysis_draft"] + "\n\n" + out
         self.state["analysis"] = out
         crit = list_items(get_section(out, "acceptance criteria"))
@@ -296,7 +305,7 @@ class Pipeline:
             crit = ["The original request is fully and correctly implemented."]
         self.state["criteria"] = crit[:15]
         for i, c in enumerate(self.state["criteria"], 1):
-            ui.info("%d. %s" % (i, c[:110]))
+            self._info("%d. %s" % (i, c[:110]))
 
         questions = [q for q in list_items(get_section(out, "questions")) if not is_none(q)]
         if questions and not self.state.get("clarifications") and self.cfg.interactive and self.ask:
@@ -344,12 +353,12 @@ class Pipeline:
                 emit("notice", level="info", text="계획 승인")
                 break
             if r >= self.cfg.plan_rounds:
-                ui.warn("plan still has open issues after %d rounds; continuing with the latest plan" % r)
+                self._warn("plan still has open issues after %d rounds; continuing with the latest plan" % r)
                 if issues or missing:
                     self.state["plan"] += "\n\n## Reviewer notes to respect during implementation\n" + "\n".join(
                         "- " + str(i) for i in issues) + "\n" + "\n".join("- " + m for m in missing)
                 break
-            ui.warn("plan rejected (%d issues) — revising" % (len(issues) + len(missing)))
+            self._warn("plan rejected (%d issues) — revising" % (len(issues) + len(missing)))
             feedback = (
                 "## Your previous plan was REJECTED by the reviewer. Write a corrected, complete plan.\n"
                 "### Reviewer findings\n%s\n### Previous plan\n%s" % (
@@ -362,7 +371,7 @@ class Pipeline:
         self.state["steps"] = [asdict(s) for s in steps]
         self.state["step_index"] = 0
         self.skills = self._pick_skills(self.request + "\n" + self.state["analysis"] + "\n" + self.state["plan"])
-        ui.info("%d implementation steps" % len(steps))
+        self._info("%d implementation steps" % len(steps))
         self._goto("implement")
 
     # --- 5. IMPLEMENT ------------------------------------------------------
@@ -386,7 +395,7 @@ class Pipeline:
             out = self.call("implement", prompt, expect_files=True)
             parsed = parse_file_blocks(out)
             if not parsed.blocks:
-                ui.warn("no file blocks in the answer — retrying once with a format reminder")
+                self._warn("no file blocks in the answer — retrying once with a format reminder")
                 out = self.call("implement", prompt + "\n\nIMPORTANT: your previous answer contained no "
                                 "=== FILE: path === blocks. Output the files now in exactly that format.",
                                 expect_files=True)
@@ -414,7 +423,7 @@ class Pipeline:
             if not files:
                 findings.append(Finding("error", "", "No files were produced. Implement the deliverables as FILE blocks."))
             n_err = sum(1 for f in findings if f.level == "error")
-            (ui.warn if n_err else ui.ok)("automated checks: %d errors, %d warnings" % (
+            (self._warn if n_err else self._info)("automated checks: %d errors, %d warnings" % (
                 n_err, sum(1 for f in findings if f.level == "warning")))
             checks_text = format_findings(findings)
 
@@ -443,7 +452,7 @@ class Pipeline:
             })
             self.save()
             for i in issues[:12]:
-                ui.info(str(i)[:140])
+                self._info(str(i)[:140])
             from .events import emit
             if passed:
                 emit("notice", level="info", text="검토 %d차: 통과" % r)
@@ -455,14 +464,14 @@ class Pipeline:
                 break
             if r >= self.cfg.max_review_rounds:
                 if not passed:
-                    ui.warn("stopping after %d review rounds with open issues" % r)
+                    self._warn("stopping after %d review rounds with open issues" % r)
                 break
             to_fix = [str(i) for i in issues] + ["[major] criterion not met: " + f for f in fails]
             to_fix += [str(f) for f in findings if f.level in ("error", "warning")]
             if not to_fix and not passed:
                 to_fix = ["[major] The reviewer rejected the result:\n" + (get_section(review, "criteria") or review[-2000:])]
             if not to_fix:
-                ui.info("no issues found — running an independent second-opinion review")
+                self._info("no issues found — running an independent second-opinion review")
                 continue
             self._fix(r, to_fix, checks_text, files)
         self._goto("final")
@@ -519,14 +528,19 @@ class Pipeline:
         report = self.call("final", prompt)
         (self.run_dir / "REPORT.md").write_text(report, encoding="utf-8")
         self.state["status"] = "done" if "PASSED" == status_line else "incomplete"
-        print()
-        print(report)
-        print()
-        ui.info("report: %s" % (self.run_dir / "REPORT.md"))
-        ui.info("logs of every phase: %s" % self.run_dir)
-        ui.status("  📊 ")
+        if self.quiet:
+            from .events import emit
+            emit("assistant", text=report)
+        else:
+            print()
+            print(report)
+            print()
+        self._info("report: %s" % (self.run_dir / "REPORT.md"))
+        self._info("logs of every phase: %s" % self.run_dir)
+        if not self.quiet:
+            ui.status("  📊 ")
         if self.ws.backup_dir and self.ws.backup_dir.exists():
-            ui.info("originals of overwritten files: %s" % self.ws.backup_dir)
+            self._info("originals of overwritten files: %s" % self.ws.backup_dir)
         self._goto("done")
 
 

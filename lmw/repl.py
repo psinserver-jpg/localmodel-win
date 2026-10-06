@@ -38,7 +38,7 @@ except ImportError:
 # (command, description, group) — drives /help, the "/" menu and Tab completion
 COMMANDS = [
     ("/run", "에이전트로 작업 (파일 읽기·쓰기·명령)", "작업"),
-    ("/deep", "큰 작업을 8단계로 끝까지 (생각·계획·검토·수정)", "작업"),
+    ("/plan", "계획 단계로 진행: 분석 → 계획 → 구현 → 검토·수정 반복 (/계획, /plan 요청)", "작업"),
     ("/ask", "질문하기 (읽기만, 변경 없음)", "작업"),
     ("/new", "새 세션 시작", "작업"),
     ("/mode", "권한 모드: 매번 묻기 / 편집 자동 수락 / 전체 허용", "설정"),
@@ -177,6 +177,7 @@ class Shell:
         self.background = False
         self.read = ui.read_line
         self.workers: List["Shell"] = []
+        self.plan_next = False  # /plan without a request: the next request runs in plan mode
 
     # ------------------------------------------------------------------ main
     bridge = None
@@ -344,6 +345,8 @@ class Shell:
                        ("class:hint", " (shift+tab 전환)")]
             if self.effort != "auto":
                 out.append(("class:hint", " · 생각: " + EFFORT_LABELS.get(self.effort, self.effort)))
+            if self.plan_next:
+                out.insert(0, ("class:mode", "  ◆ 계획 모드 — 다음 요청을 단계별로 진행"))
             from . import updater
             if updater.latest:
                 out.append(("class:mode", " · 새 버전 v%s → /update" % updater.latest))
@@ -422,8 +425,15 @@ class Shell:
                     self._remote_control("effort", list(EFFORT_LABELS)[i])
         elif cmd in ("/new", "/clear"):
             self.new_session()
-        elif cmd == "/deep":
-            self.handle(arg, route_override="deep") if arg else ui.warn("사용법: /deep <요청>")
+        elif cmd in ("/plan", "/계획", "/deep"):
+            if arg in ("off", "취소"):
+                self.plan_next = False
+                ui.info(ui.dim("계획 모드 취소"))
+            elif arg:
+                self.handle(arg, route_override="deep")
+            else:
+                self.plan_next = True
+                ui.info(ui.accent("◆ 계획 모드") + ui.dim(" — 다음에 입력하는 요청을 계획 단계에 맞춰 끝까지 진행합니다 (취소: /plan off)"))
         elif cmd == "/engine":
             from .agent import aider_available
             if arg in ("lmw", "aider"):
@@ -556,6 +566,9 @@ class Shell:
         from .events import emit
         from .stats import STATS
         emit("user", text=text)
+        if self.plan_next and not route_override:
+            self.plan_next = False
+            route_override = "deep"
         kind = route_override or route(text, self.effort)
         if self.bridge and not self.titled:
             self.bridge.set_meta(sid=self.sid, title=text.strip().replace("\n", " ")[:60])
@@ -570,7 +583,6 @@ class Shell:
             if kind == "chat":
                 self._get_agent().chat(text)
             elif kind == "deep":
-                emit("notice", level="info", text="큰 작업이라 깊게 진행합니다 (생각 → 계획 → 구현 → 검토·수정)")
                 self.task(text)
             elif kind == "aider":
                 if self.perms.mode == "ask" and self.ask_permission({
@@ -734,14 +746,10 @@ class Shell:
         ctx = "\n".join("- " + t for t in self.done_tasks[-5:])
         pipe = Pipeline(self.cfg, self.root, request=request, client=self.client,
                         ask=self._ask_user, approve=self._approve, session_context=ctx)
+        pipe.quiet = True  # one line per stage, then the result — not every phase's details
         self.last_run = pipe
         state = pipe.run()
         self.done_tasks.append(request.strip().replace("\n", " ")[:300])
-        report = pipe.run_dir / "REPORT.md"
-        if report.is_file():
-            from .events import BUS
-            for sink in list(BUS.sinks):  # the report is already printed in the terminal
-                sink({"type": "assistant", "text": report.read_text(encoding="utf-8"), "ts": time.time()})
         if state.get("status") == "done":
             ui.ok("완료 — 이어서 수정 요청을 하거나 /undo 로 되돌릴 수 있습니다")
         else:
