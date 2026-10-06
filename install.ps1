@@ -3,6 +3,12 @@
 #   cmd:         powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/install.ps1 | iex"
 # Then open a NEW terminal and type:  lmw
 $ErrorActionPreference = "Stop"
+trap {
+    Write-Host ("  ✘ 설치 실패 (install.ps1 {0}번째 줄): {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message) -ForegroundColor Red
+    Write-Host ("    {0}" -f $_.InvocationInfo.Line.Trim()) -ForegroundColor DarkGray
+    Write-Host "    실행 중인 lmw 창을 모두 닫고 다시 실행해 보세요. 계속되면 위 두 줄을 알려주세요." -ForegroundColor Red
+    break
+}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 $Repo   = "psinserver-jpg/localmodel-win"
 $Branch = if ($env:LMW_BRANCH) { $env:LMW_BRANCH } else { "main" }
@@ -71,7 +77,9 @@ try {
 # Put our bin FIRST on the user PATH so an older `lmw` elsewhere can't shadow it
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $parts = @($userPath -split ";" | Where-Object { $_ -and ($_.TrimEnd("\") -ne $Bin.TrimEnd("\")) })
-[Environment]::SetEnvironmentVariable("Path", (@($Bin) + $parts) -join ";", "User")
+try { [Environment]::SetEnvironmentVariable("Path", (@($Bin) + $parts) -join ";", "User") } catch {
+    Write-Host "  ! PATH 등록 실패: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 $env:Path = "$Bin;" + $env:Path
 
 # Older lmw launchers elsewhere on PATH (earlier installs, pip) would still win from the system PATH:
@@ -79,8 +87,8 @@ $env:Path = "$Bin;" + $env:Path
 $ours = Join-Path $Bin "lmw.cmd"
 foreach ($c in @(Get-Command lmw -All -ErrorAction SilentlyContinue)) {
     $f = $c.Source
-    if (-not $f -or ((Resolve-Path $f).Path -eq (Resolve-Path $ours).Path)) { continue }
     try {
+        if (-not $f -or ([IO.Path]::GetFullPath($f) -eq [IO.Path]::GetFullPath($ours))) { continue }
         if ($f -match "\.(cmd|bat)$") {
             Copy-Item $f "$f.old" -Force
             Set-Content -Path $f -Value "@echo off`r`ncall `"$ours`" %*`r`n" -Encoding ASCII
