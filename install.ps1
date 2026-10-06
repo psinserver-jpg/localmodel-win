@@ -57,6 +57,9 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "lmw\__main__.py"))) 
     }
 }
 
+# Claude-Code-style input box (optional; lmw works without it)
+try { & ([scriptblock]::Create("$py -m pip install --user --quiet --disable-pip-version-check prompt_toolkit")) *> $null } catch {}
+
 # 3) `lmw` command
 $launcher = "@echo off`r`nchcp 65001 >nul`r`nset `"PYTHONUTF8=1`"`r`nset `"PYTHONPATH=$App;%PYTHONPATH%`"`r`n$py -m lmw %*`r`n"
 try {

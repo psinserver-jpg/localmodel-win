@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import os
 import shutil
 import sys
@@ -41,7 +42,12 @@ def red(text: str) -> str:
 
 
 def prompt_label(text: str) -> str:
-    return _c("1;35", text + " ❯")
+    return accent(_c("1", "> ")) if text == "lmw" else _c("1;35", text + " ❯")
+
+
+def accent(text: str) -> str:
+    """LMW orange (truecolor; Windows Terminal, Ghostty and modern consoles)."""
+    return "\033[38;2;217;122;74m%s\033[0m" % text if _COLOR else text
 
 
 def dim(text: str) -> str:
@@ -77,13 +83,14 @@ def box(title: str, lines, color: str = "36") -> None:
     out = []
     for l in lines:
         cur = ""
-        for ch in l:  # wrap by display width (Korean/emoji are 2 columns)
-            if dwidth(cur + ch) > inner:
-                out.append(cur)
+        for tok in re.findall(r"\x1b\[[0-9;]*m|.", l, re.S):  # wrap by display width; keep color codes whole
+            if not tok.startswith("\x1b") and dwidth(cur + tok) > inner:
+                out.append(cur + ("\x1b[0m" if "\x1b" in cur else ""))
                 cur = ""
-            cur += ch
+            cur += tok
         out.append(cur)
-    top = "╭─ " + title + " " + "─" * max(0, inner - dwidth(title) - 1) + "╮"
+    top = ("╭─ " + title + " " + "─" * max(0, inner - dwidth(title) - 1) + "╮") if title else \
+        "╭" + "─" * (inner + 2) + "╮"
     print(_c(color, top))
     for l in out:
         print(_c(color, "│ ") + _pad(l, inner) + _c(color, " │"))
@@ -180,6 +187,7 @@ class Progress:
     def __init__(self, verbose: bool, show_status: bool = True):
         self.verbose = verbose
         self.show_status = show_status
+        self._t0 = time.time()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -188,12 +196,21 @@ class Progress:
             self._thread = threading.Thread(target=self._tick, daemon=True)
             self._thread.start()
 
+    GLYPHS = "·✢✳✶✻✽✻✶✳✢"
+
     def _render(self) -> None:
-        line = "  ⟳ " + status_line()
-        w = _width() - 6  # emoji are double-width in most terminals
-        line = line[:w]
+        from .stats import STATS, fmt_tokens
+        self._n = getattr(self, "_n", 0) + 1
+        c = STATS.current
+        secs = int(time.time() - self._t0)
+        toks = c.out_text_tokens if c else 0
+        verb = "생각하는 중…" if c is None or c.first_token is None else "작성 중…"
+        g = self.GLYPHS[self._n % len(self.GLYPHS)]
+        line = "%s %s (%ds · ↓ %s 토큰 · Ctrl+C 로 중지)" % (g, verb, secs, fmt_tokens(toks))
+        head, rest = g + " " + verb, line[len(g) + 1 + len(verb):]
+        pad = " " * max(0, _width() - 2 - dwidth(line))
         with self._lock:
-            sys.stdout.write("\r" + _c("36", line) + " " * max(0, w - len(line)))
+            sys.stdout.write("\r" + accent(head) + _c("2", rest) + pad + "\r")
             sys.stdout.flush()
 
     def _tick(self) -> None:
@@ -228,9 +245,21 @@ def set_input_hook(hook) -> None:
     _input_hook = hook
 
 
-def read_line(prompt: str = "") -> str:
+# Set by the shell: slash commands, hint line and Shift+Tab handler for the Claude-style input box.
+TUI = {"commands": [], "hints": lambda: [], "shift_tab": None, "choose_active": False}
+
+
+def read_line(prompt: str = "", main: bool = False) -> str:
+    """main=True: the big input box (lmw ❯). Otherwise a one-line question."""
     if _input_hook is not None:
-        return _input_hook(prompt)
+        try:
+            return _input_hook(prompt, main)
+        except TypeError:  # hooks that only take a prompt
+            return _input_hook(prompt)
+    if main:
+        from . import tui
+        if tui.available():
+            return tui.input_box(TUI["commands"], TUI["hints"], TUI["shift_tab"])[1]
     return input(prompt)
 
 

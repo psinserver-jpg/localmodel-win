@@ -151,9 +151,12 @@ class Shell:
 
     def loop(self) -> int:
         _setup_completion()
+        self._setup_tui()
         self._banner()
         self.connect_hub()
-        print(ui.dim("  Enter = 메뉴 · / = 전체 명령 · Tab = 명령 자동완성 · 질문은 ? 로 끝내기"))
+        from . import tui
+        if not tui.available():
+            print(ui.dim("  Enter = 메뉴 · / = 전체 명령 · Tab = 명령 자동완성 · 질문은 ? 로 끝내기"))
         try:
             return self._loop()
         finally:
@@ -223,8 +226,10 @@ class Shell:
                     print(ui.prompt_label("lmw") + " " + line + ui.dim("   [대기열]"))
                 else:
                     print()
-                    ui.status()
-                    line = ui.read_line(ui.prompt_label("lmw") + " ").strip()
+                    from . import tui
+                    if not tui.available():
+                        ui.status()
+                    line = ui.read_line(ui.prompt_label("lmw") + " ", main=True).strip()
             except EOFError:
                 print()
                 return 0
@@ -263,14 +268,46 @@ class Shell:
             except (FileNotFoundError, ValueError) as e:
                 ui.err(str(e))
 
+    def _setup_tui(self) -> None:
+        """Claude-Code-style input box: slash completion, hint line, Shift+Tab permission modes."""
+        ui.TUI["commands"] = [(c, d) for c, d, _ in COMMANDS]
+
+        def hints():
+            mode = self.perms.mode
+            if mode == "ask":
+                out = [("class:hint", "  ? /help · / 명령 · shift+tab 권한 모드 · Alt+Enter 줄바꿈")]
+            else:
+                out = [("class:mode", "  ⏵⏵ " + MODE_LABELS.get(mode, mode)),
+                       ("class:hint", " (shift+tab 전환)")]
+            if self.effort != "auto":
+                out.append(("class:hint", " · 생각: " + EFFORT_LABELS.get(self.effort, self.effort)))
+            return out
+
+        def shift_tab():
+            order = ["ask", "auto-edit", "full"]
+            mode = order[(order.index(self.perms.mode) + 1) % 3 if self.perms.mode in order else 0]
+            self.perms.mode = mode
+            if self.bridge:
+                try:
+                    self.bridge.set_meta(sid=self.sid, mode=mode)
+                except Exception:
+                    pass
+
+        ui.TUI["hints"] = hints
+        ui.TUI["shift_tab"] = shift_tab
+
     def _banner(self) -> None:
         user = (self.auth or {}).get("user", "")
         print()
-        ui.box("LMW %s · Local Model Workflow" % __version__, [
-            "👤 계정   " + (user or "-"),
-            "🤖 모델   %s  (%s, %dK)" % (self.cfg.model, _server_label(self.cfg), self.cfg.context_tokens // 1024),
-            "📁 폴더   %s" % self.root,
-        ])
+        ui.box("", [
+            ui.accent("✻") + " " + ui.bold("LMW 에 오신 것을 환영합니다!") + ui.dim("  v" + __version__),
+            "",
+            ui.dim("  /help 도움말 · /mode 권한 · /model 모델"),
+            "",
+            ui.dim("  cwd: ") + str(self.root),
+            ui.dim("  모델: ") + "%s  (%s, %dK)" % (self.cfg.model, _server_label(self.cfg), self.cfg.context_tokens // 1024),
+            ui.dim("  계정: ") + (user or "-"),
+        ], "38;2;217;122;74")
         self._check_model()
 
     def _check_model(self) -> None:
@@ -484,6 +521,9 @@ class Shell:
     def ask_permission(self, req: Dict) -> str:
         """Ask the user (terminal or website) before an important action. Returns allow/always/deny."""
         from .events import emit
+        from . import tui
+        if not self.background and tui.available():
+            return self._ask_permission_menu(req)
         emit("permission", **req)
         answers = {"y": "allow", "yes": "allow", "": "allow", "ㅛ": "allow", "a": "always", "ㅁ": "always",
                    "always": "always", "n": "deny", "no": "deny", "ㅜ": "deny"}
@@ -509,6 +549,44 @@ class Shell:
                 continue
             emit("permission_result", id=req["id"], decision=decision, by=by)
             return decision
+
+    def _ask_permission_menu(self, req: Dict) -> str:
+        """Claude-style arrow-key permission menu; the website can answer it too."""
+        from .events import emit, diff_preview
+        from . import tui
+        ui.TUI["choose_active"] = True
+        try:
+            emit("permission", **req)  # web gets the card; the terminal shows the menu below
+        finally:
+            ui.TUI["choose_active"] = False
+        tool = str(req.get("tool", ""))
+        lines = [ui.bold(str(req.get("title", "")))]
+        if req.get("detail") and not req.get("diff"):
+            lines += ["  " + l for l in str(req["detail"]).splitlines()[:8]]
+        lines += diff_preview(str(req.get("diff") or ""), 12)
+        if req.get("danger"):
+            lines.append(ui.yellow("⚠ 위험할 수 있는 작업입니다"))
+        lines += ["", "계속할까요?" if tool == "bash" else "이 변경을 적용할까요?"]
+        again = "예, 이 세션에서 이 명령은 다시 묻지 않기" if tool == "bash" else "예, 이 세션에서 편집은 다시 묻지 않기"
+        decisions = ["allow", "always", "deny"]
+
+        def accept(item):
+            text = item[1] if isinstance(item, tuple) else str(item)
+            if text.startswith(PERM_PREFIX):
+                pid, _, d = text[len(PERM_PREFIX):].partition(":")
+                if pid == req["id"] and d in decisions:
+                    return decisions.index(d)
+                return -1  # stale click: drop it
+            return None
+
+        ch = self.bridge.channel(self.sid) if self.bridge else None
+        idx, src = tui.choose(lines, ["예", again, "아니요 (다르게 하라고 알려주기)"],
+                              external=getattr(ch, "inbox", None), accept_external=accept)
+        if idx < 0:
+            idx = 2
+        decision = decisions[idx]
+        emit("permission_result", id=req["id"], decision=decision, by="web" if src == "web" else "terminal")
+        return decision
 
     def _remote_control(self, action: str, value: str) -> None:
         from .events import emit

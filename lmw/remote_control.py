@@ -336,6 +336,7 @@ class Bridge:
         self._started = False
         self._pending_line = ""
         self.mirror_terminal = False
+        self.tui = False  # set by start(): prompt_toolkit input box instead of the keyboard thread
         self.on_new_session: Callable[[], None] = lambda: None  # set by the shell
         self.main: Channel = self.new_session()
         self._orig_out, self._orig_err = sys.stdout, sys.stderr
@@ -495,12 +496,32 @@ class Bridge:
                 return
             self.main.inbox.put(("key", line.rstrip("\r\n")))
 
-    def read_line(self, prompt: str = "") -> str:
+    def read_line(self, prompt: str = "", main: bool = False) -> str:
         """Terminal session input: keyboard or the website, whichever comes first."""
+        from . import tui
+        ch = self.main
+        if self.tui:
+            if main:  # Claude-style input box; a prompt from the website ends it
+                ch.prompt = "lmw ❯"
+                try:
+                    source, text = tui.input_box(ui.TUI["commands"], ui.TUI["hints"], ui.TUI["shift_tab"],
+                                                 external=ch.inbox)
+                finally:
+                    ch.prompt = ""
+                if source == "eof":
+                    raise EOFError
+                if source == "web" and not text.startswith("\x00"):
+                    with ui.remote_muted():
+                        print(ui.accent("> ") + text + "   " + ui.dim("[원격]"))
+                elif source == "key" and text.strip():
+                    with ui.remote_muted():
+                        print(ui.accent("> ") + text.replace("\n", "\n  "))
+                return text
+            with ui.remote_muted():  # short questions (menus): keyboard only
+                return input(prompt)
         with ui.remote_muted():
             sys.stdout.write(prompt)
             sys.stdout.flush()
-        ch = self.main
         # a permission question is already shown on the web as a card with buttons
         ch.prompt = "" if "[a]lways" in prompt else _ANSI.sub("", prompt).strip()
         try:
@@ -531,6 +552,9 @@ class Bridge:
         if self.mirror_terminal:
             sys.stdout = _Tee(self._orig_out, self)
             sys.stderr = _Tee(self._orig_err, self)
+        from . import tui
+        self.tui = keyboard and tui.available()
+        keyboard = keyboard and not self.tui
         ui.set_input_hook(self.read_line)
         BUS.subscribe(self.event)
         self._started = True

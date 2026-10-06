@@ -36,14 +36,25 @@ lmw ❯ 카페 홈페이지 만들어줘. 메뉴, 위치, 예약 버튼 포함
 그냥 말하듯 입력하면 됩니다. lmw 가 알아서 파일을 **찾고(Grep·Glob) → 읽고(Read) → 고치고(Edit·Write) → 실행해서 확인(Bash)** 합니다.
 
 ```
-lmw ❯ calc.py 의 add 버그 고쳐줘
+> calc.py 의 add 버그 고쳐줘
+
 ✻ 생각함 (1.2초)
-● Grep(def add)        ⎿ 1개 일치
-● Read(calc.py)        ⎿ 4줄 읽음
-● Edit(calc.py)        ⎿ +1 −1
-● Bash(python calc.py) ⎿ exit 0
-고쳤습니다. add 가 이제 더하기를 합니다.
+
+● Read(calc.py)
+  ⎿  4줄 읽음
+
+● Edit(calc.py)
+  ⎿  +1 −1
+          2 -     return a-b
+          2 +     return a+b
+
+● Bash(python calc.py)
+  ⎿  exit 0
+
+● 고쳤습니다. add 가 이제 더하기를 합니다.
 ```
+
+Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **Shift+Tab** 으로 권한 모드 전환, 파일 수정 전 **변경 미리보기 + 방향키 선택 메뉴**(예 · 다시 묻지 않기 · 아니요)가 나옵니다.
 
 | 상황 | 동작 |
 |---|---|
@@ -57,9 +68,8 @@ lmw ❯ calc.py 의 add 버그 고쳐줘
 | `/effort` | 생각 수준: 자동 · 빠르게 · 보통 · 깊게 |
 | `/new` | 새 세션 |
 | `/undo` · `/model` | 되돌리기 · 모델 바꾸기 |
-| `Enter` · `/` | 메뉴 · 전체 명령 |
+| `/` · `Shift+Tab` · `Alt+Enter` | 명령 자동완성 · 권한 모드 전환 · 줄바꿈 |
 
-파일 수정·명령 실행 전에는 물어봅니다: `y` 허용 · `a` 항상 허용 · `n` 거부.
 `lmw` 가 켜져 있으면 [psin.ai.kr](https://psin.ai.kr) 에서 **＋ 새 세션** 을 눌러 같은 lmw 안에 세션을 더 열 수 있습니다 (터미널 세션은 그대로).
 [psin.ai.kr](https://psin.ai.kr) 에 같은 Google 계정으로 로그인하면 세션별 대화, 생각/작업 펼쳐보기, 권한 승인, 프롬프트 보내기를 폰에서도 할 수 있습니다.
 

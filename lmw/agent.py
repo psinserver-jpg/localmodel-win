@@ -195,6 +195,21 @@ class Tools:
         minus = sum(1 for l in d.splitlines() if l.startswith("-") and not l.startswith("---"))
         return True, "+%d −%d" % (plus, minus), "", {"diff": d}
 
+    def preview(self, name: str, args: Dict) -> str:
+        """Diff of a proposed write/edit (nothing is written) — shown when asking permission."""
+        try:
+            rel = self.ws.rel(self._path(args.get("path", "")))
+            cur = self.ws.read(rel) if (self.root / rel).exists() else None
+            if name == "write_file":
+                return _diff(cur or "", str(args.get("content", "")), rel)
+            if name == "edit_file" and cur is not None:
+                old, new = str(args.get("old_string", "")), str(args.get("new_string", ""))
+                if old and old in cur:
+                    return _diff(cur, cur.replace(old, new) if args.get("replace_all") else cur.replace(old, new, 1), rel)
+        except Exception:
+            pass
+        return ""
+
     def list_dir(self, path: str = ".", **_):
         p = self._path(path)
         if not p.is_dir():
@@ -542,14 +557,18 @@ class Agent:
         if ask:
             pid = "p" + cid[1:]
             detail = str(args.get("command") or args.get("path") or "")
-            decision = self.ask_permission({"id": pid, "tool": name, "title": _perm_title(name, args),
-                                            "detail": detail, "danger": danger})
+            req = {"id": pid, "tool": name, "title": _perm_title(name, args), "detail": detail, "danger": danger}
+            if name in ("write_file", "edit_file"):
+                req["diff"] = _clip(self.tools.preview(name, args), 6000)
+            decision = self.ask_permission(req)
             if decision == "deny":
                 emit("tool_result", id=cid, ok=False, summary="사용자가 거부함")
                 return _result(name, False, "The user DENIED this action. Do not retry it; choose another approach or ask the user.")
             if decision == "always":
                 self.perms.remember(name, args)
         ok, summary, output, extra = self.tools.run(name, args)
+        if name == "bash":
+            extra.setdefault("_show", True)  # the terminal shows the first lines of command output
         emit("tool_result", id=cid, ok=ok, summary=summary, output=_clip(output, 6000), **extra)
         body = output if output else summary
         if extra.get("diff") and not output:

@@ -25,6 +25,10 @@ else
   fi
 fi
 
+# Claude-Code-style input box (optional; lmw works without it)
+python3 -m pip install --user --quiet --disable-pip-version-check prompt_toolkit >/dev/null 2>&1 \
+  || python3 -m pip install --user --quiet --break-system-packages prompt_toolkit >/dev/null 2>&1 || true
+
 mkdir -p "$BIN"
 cat > "$BIN/lmw" <<WRAP
 #!/usr/bin/env sh
