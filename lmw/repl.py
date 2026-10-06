@@ -162,10 +162,28 @@ class Shell:
         finally:
             self.disconnect_hub()
 
-    def connect_hub(self) -> None:
+    _hub_retry = 0.0
+
+    def connect_hub(self, quiet: bool = False) -> None:
         """Always-on remote control: publish this session to the user's Hub account."""
-        from .remote_control import Bridge
+        from .remote_control import Bridge, whoami
         if not self.auth or self.bridge:
+            return
+        self._hub_retry = time.time()
+        if self.auth.get("offline"):
+            if quiet:  # check in the background so the prompt never waits on the network
+                auth = self.auth
+
+                def probe():
+                    try:
+                        user = whoami(auth)
+                    except OSError:
+                        return
+                    if user:
+                        auth["user"] = user
+                        auth.pop("offline", None)
+                        self._hub_retry = 0.0  # connect before the next prompt
+                threading.Thread(target=probe, daemon=True).start()
             return
         try:
             self.bridge = Bridge(self.auth, "lmw", str(self.root), self.cfg.model,
@@ -174,7 +192,9 @@ class Shell:
             self.bridge.on_control = self._remote_control
             self.bridge.on_new_session = self.open_web_session
         except Exception as e:
-            ui.warn("Hub 연결 실패 (%s) — 이 컴퓨터에서만 작업합니다" % e)
+            self.bridge = None
+            if not quiet:
+                ui.warn("Hub 연결 실패 (%s) — 이 컴퓨터에서 작업하며, 연결되면 자동으로 다시 붙습니다" % e)
             return
         self.bridge.start()
         ui.ok("이 화면이 실시간으로 공유됩니다 — 웹(%s) 또는 다른 컴퓨터의 lmw(/watch)에서 %s 계정으로 보기·입력"
@@ -225,6 +245,8 @@ class Shell:
                     line = self.pending.pop(0).strip()
                     print(ui.prompt_label("lmw") + " " + line + ui.dim("   [대기열]"))
                 else:
+                    if self.auth and not self.bridge and time.time() - self._hub_retry > 30:
+                        self.connect_hub(quiet=True)  # Hub came back: turn remote control on
                     print()
                     from . import tui
                     if not tui.available():

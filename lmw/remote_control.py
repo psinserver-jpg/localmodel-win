@@ -71,13 +71,37 @@ def save_auth(data: Dict[str, str]) -> None:
 
 def whoami(auth: Dict[str, str]) -> Optional[str]:
     """User name if the saved token is valid; None if rejected. Raises OSError if the hub is unreachable."""
-    try:
-        _, d = _req("GET", auth["hub"].rstrip("/") + "/api/cli/whoami", token=auth["token"], timeout=8)
-        return d.get("user")
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return None
-        raise OSError("hub error %s" % e.code)
+    url = auth["hub"].rstrip("/") + "/api/cli/whoami"
+    for attempt in range(2):
+        try:
+            _, d = _req("GET", url, token=auth["token"], timeout=10)
+            return d.get("user")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return None
+            err: OSError = OSError("서버 응답 HTTP %s%s" % (e.code, " (Hub 서버가 꺼져 있음)" if e.code in (502, 503, 504, 521, 522, 523) else ""))
+        except ValueError:
+            err = OSError("Hub 가 아닌 응답 (주소 확인: lmw login → Hub 주소 변경)")
+        except OSError as e:
+            err = OSError(_net_reason(e))
+        if attempt == 0:
+            time.sleep(1.5)
+    raise err
+
+
+def _net_reason(e: BaseException) -> str:
+    """Short Korean reason for a network error."""
+    r = getattr(e, "reason", e)
+    t = str(r)
+    if "CERTIFICATE" in t.upper() or "SSL" in t.upper():
+        return "인증서(SSL) 오류: %s" % t
+    if isinstance(r, socket.timeout) or "timed out" in t:
+        return "응답 시간 초과"
+    if isinstance(r, socket.gaierror) or "getaddrinfo" in t or "Name or service" in t:
+        return "주소(DNS)를 찾을 수 없음"
+    if "refused" in t.lower() or "10061" in t:
+        return "연결 거부됨"
+    return t
 
 
 def _device_name() -> str:
@@ -263,8 +287,10 @@ def require_login(hub: str = "") -> Optional[Dict[str, str]]:
     if auth:
         try:
             user = whoami(auth)
-        except OSError:
-            ui.warn("Hub(%s)에 연결할 수 없어 오프라인으로 시작합니다 — 원격 제어는 연결되면 다시 시도하세요" % auth["hub"])
+        except OSError as e:
+            ui.warn("Hub(%s)에 연결할 수 없어 오프라인으로 시작합니다 — %s" % (auth["hub"], e))
+            ui.info(ui.dim("연결되면 자동으로 원격 제어가 켜집니다"))
+            auth["offline"] = "1"
             return auth
         if user:
             auth["user"] = user
