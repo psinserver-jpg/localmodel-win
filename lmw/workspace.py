@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -13,7 +14,11 @@ IGNORE_DIRS = {
     ".git", ".hg", ".svn", ".lmw", "node_modules", "__pycache__", ".venv", "venv", "env",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".idea", ".vscode", ".next", ".nuxt",
     "dist", "build", "coverage", ".cache", "target",
+    # game engines / big tool caches (Unity, Unreal, Gradle, ...)
+    "Library", "Temp", "Logs", "obj", "Intermediate", "DerivedDataCache", "Saved", ".gradle",
+    "site-packages", "__pypackages__",
 }
+MAX_WALK_FILES = 20000  # stop listing after this many files (huge folders stay fast)
 MAX_TEXT_BYTES = 256_000
 
 
@@ -45,14 +50,27 @@ class Workspace:
         return p.resolve().relative_to(self.root).as_posix()
 
     # ----------------------------------------------------------------- reads
-    def iter_files(self) -> Iterable[Path]:
-        for p in sorted(self.root.rglob("*")):
-            if not p.is_file():
-                continue
-            parts = p.relative_to(self.root).parts
-            if any(part in IGNORE_DIRS for part in parts[:-1]):
-                continue
-            yield p
+    def iter_files(self, limit: int = MAX_WALK_FILES) -> Iterable[Path]:
+        """Project files, skipping caches, hidden folders, links and anything unreadable.
+
+        Unreadable folders, broken links/junctions and too-long Windows paths are ignored instead of
+        raising (e.g. WinError 3 inside a Blender add-on folder must not stop lmw)."""
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(self.root, topdown=True, onerror=lambda e: None,
+                                                    followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d not in IGNORE_DIRS and (not d.startswith(".") or d in (".github",)))
+            for name in sorted(filenames):
+                p = Path(dirpath) / name
+                try:
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                yield p
+                count += 1
+                if count >= limit:
+                    return
 
     def list_files(self) -> List[str]:
         return [self.rel(p) for p in self.iter_files()]
@@ -62,9 +80,15 @@ class Workspace:
             p = self.resolve(rel)
         except UnsafePathError:
             return None
-        if not p.is_file() or p.stat().st_size > MAX_TEXT_BYTES:
+        try:
+            if not p.is_file() or p.stat().st_size > MAX_TEXT_BYTES:
+                return None
+        except OSError:
             return None
-        data = p.read_bytes()
+        try:
+            data = p.read_bytes()
+        except OSError:
+            return None
         if b"\x00" in data[:4096]:
             return None
         for enc in ("utf-8", "utf-8-sig", "cp949", "latin-1"):
@@ -80,7 +104,10 @@ class Workspace:
             return "(empty — this is a new project)"
         lines = []
         for f in files[:max_entries]:
-            size = (self.root / f).stat().st_size
+            try:
+                size = (self.root / f).stat().st_size
+            except OSError:
+                continue
             lines.append("- %s (%d bytes)" % (f, size))
         if len(files) > max_entries:
             lines.append("- ... and %d more files" % (len(files) - max_entries))

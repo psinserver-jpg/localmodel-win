@@ -474,6 +474,8 @@ class Shell:
             emit("notice", level="warn", text="중지했습니다")
         except ModelError as e:
             emit("error", text=str(e))
+        except Exception as e:  # a failing turn must never close lmw
+            emit("error", text="%s: %s" % (type(e).__name__, e))
         finally:
             if self.bridge:
                 self.bridge.channel(self.sid).running = False
