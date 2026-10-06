@@ -124,6 +124,22 @@ def diff_preview(diff: str, max_lines: int = 14) -> List[str]:
     return out
 
 
+def _phase_detail(d: str) -> str:
+    """English stage details from the workflow -> short Korean."""
+    import re
+    fixed = {"analysing the request": "요청 분석 중", "checking the understanding": "이해한 내용 검토 중",
+             "final report": "결과 보고서 작성 중"}
+    if d in fixed:
+        return fixed[d]
+    m = re.match(r"step (\d+)/(\d+): (.*)", d)
+    if m:
+        return "단계 %s/%s: %s" % m.groups()
+    m = re.match(r"round (\d+)(?: \((\d+) issues\))?", d)
+    if m:
+        return "%s차" % m.group(1) + (" · 문제 %s개 수정" % m.group(2) if m.group(2) else "")
+    return d
+
+
 def render(e: Event, verbose: bool = False) -> None:
     """Terminal rendering in the Claude Code style (details are also on the web)."""
     t = e["type"]
@@ -175,8 +191,11 @@ def render(e: Event, verbose: bool = False) -> None:
         print("  ⎿  " + (ui.red(word + by) if d == "deny" else ui.dim(word + by)))
     elif t == "phase":
         i = int(e.get("index", 0) or 0)
-        if 1 <= i <= len(ui.PHASES):  # one quiet line per stage; no per-phase thinking/details
-            print(ui.dim("  ◆ %d/%d %s" % (i, len(ui.PHASES), ui.PHASES[i - 1][1])))
+        if 1 <= i <= len(ui.PHASES):  # one line per stage (what it is doing), then short results under it
+            detail = _phase_detail(str(e.get("detail") or ""))
+            print()
+            print(ui.accent("◆ ") + ui.bold("%d/%d %s" % (i, len(ui.PHASES), ui.PHASES[i - 1][1]))
+                  + (ui.dim(" — " + detail) if detail else ""))
     elif t == "notice":
         level = e.get("level")
         text = str(e.get("text", ""))

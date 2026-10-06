@@ -254,6 +254,17 @@ class Pipeline:
         if not self.quiet:
             ui.info(msg)
 
+    def _brief(self, head: str, items=(), limit: int = 6) -> None:
+        """Chat-shell view of what the workflow is doing: a short line plus a few items."""
+        if not self.quiet:
+            return
+        print("  ⎿  " + head)
+        items = [str(x).replace("\n", " ").strip() for x in items if str(x).strip()]
+        for x in items[:limit]:
+            print(ui.dim("     · " + (x[:120] + ("…" if len(x) > 120 else ""))))
+        if len(items) > limit:
+            print(ui.dim("     … 외 %d개" % (len(items) - limit)))
+
     def _warn(self, msg: str) -> None:
         if not self.quiet:
             ui.warn(msg)
@@ -306,6 +317,7 @@ class Pipeline:
         self.state["criteria"] = crit[:15]
         for i, c in enumerate(self.state["criteria"], 1):
             self._info("%d. %s" % (i, c[:110]))
+        self._brief("완료 기준 %d개를 정했습니다" % len(self.state["criteria"]), self.state["criteria"])
 
         questions = [q for q in list_items(get_section(out, "questions")) if not is_none(q)]
         if questions and not self.state.get("clarifications") and self.cfg.interactive and self.ask:
@@ -359,6 +371,8 @@ class Pipeline:
                         "- " + str(i) for i in issues) + "\n" + "\n".join("- " + m for m in missing)
                 break
             self._warn("plan rejected (%d issues) — revising" % (len(issues) + len(missing)))
+            self._brief("계획 검토: 보완할 점 %d개 — 계획을 고칩니다" % (len(issues) + len(missing)),
+                        [str(i) for i in issues] + list(missing), 4)
             feedback = (
                 "## Your previous plan was REJECTED by the reviewer. Write a corrected, complete plan.\n"
                 "### Reviewer findings\n%s\n### Previous plan\n%s" % (
@@ -372,6 +386,8 @@ class Pipeline:
         self.state["step_index"] = 0
         self.skills = self._pick_skills(self.request + "\n" + self.state["analysis"] + "\n" + self.state["plan"])
         self._info("%d implementation steps" % len(steps))
+        self._brief("계획: 구현 %d단계" % len(steps),
+                    ["%s%s" % (st.title, ("  (%s)" % ", ".join(st.files[:4])) if st.files else "") for st in steps], 10)
         self._goto("implement")
 
     # --- 5. IMPLEMENT ------------------------------------------------------
@@ -425,6 +441,9 @@ class Pipeline:
             n_err = sum(1 for f in findings if f.level == "error")
             (self._warn if n_err else self._info)("automated checks: %d errors, %d warnings" % (
                 n_err, sum(1 for f in findings if f.level == "warning")))
+            self._brief("자동 검사 (파일 %d개): 오류 %d · 경고 %d" % (
+                len(files), n_err, sum(1 for f in findings if f.level == "warning")),
+                [str(f) for f in findings if f.level == "error"], 4)
             checks_text = format_findings(findings)
 
             strict = r >= 2
@@ -453,6 +472,8 @@ class Pipeline:
             self.save()
             for i in issues[:12]:
                 self._info(str(i)[:140])
+            if issues:
+                self._brief("검토에서 찾은 문제 %d개" % len(issues), [str(i) for i in issues], 5)
             from .events import emit
             if passed:
                 emit("notice", level="info", text="검토 %d차: 통과" % r)
