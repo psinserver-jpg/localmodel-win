@@ -38,17 +38,33 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "lmw\__main__.py"))) 
 } elseif (Get-Command git -ErrorAction SilentlyContinue) {
     if (Test-Path (Join-Path $App ".git")) { git -C $App pull -q origin $Branch } else { git clone -q -b $Branch "https://github.com/$Repo.git" $App }
 } else {
-    $zip = Join-Path $env:TEMP "lmw.zip"
-    Invoke-WebRequest "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip -UseBasicParsing
-    if (Test-Path $App) { Remove-Item -Recurse -Force $App }
-    Expand-Archive $zip -DestinationPath $Dest -Force
-    Move-Item (Get-ChildItem $Dest -Directory | Where-Object Name -like "localmodel-win-*" | Select-Object -First 1).FullName $App
-    Remove-Item $zip
+    # No git: download a zip and copy over the old files (no folder delete -> works even if a
+    # terminal is still open inside the old install).
+    $zip = Join-Path $env:TEMP ("lmw-" + [guid]::NewGuid().ToString() + ".zip")
+    $tmp = Join-Path $env:TEMP ("lmw-" + [guid]::NewGuid().ToString())
+    try {
+        Invoke-WebRequest "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip -UseBasicParsing
+        Expand-Archive $zip -DestinationPath $tmp -Force
+        $src = (Get-ChildItem $tmp -Directory | Select-Object -First 1).FullName
+        New-Item -ItemType Directory -Force -Path $App | Out-Null
+        Copy-Item -Path (Join-Path $src "*") -Destination $App -Recurse -Force
+    } catch {
+        Write-Host "  ✘ 다운로드/설치 실패: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "    실행 중인 lmw 창을 모두 닫고 다시 실행하세요. 계속되면 $App 폴더를 지우고 다시 시도하세요." -ForegroundColor Red
+        return
+    } finally {
+        Remove-Item -Recurse -Force $tmp, $zip -ErrorAction SilentlyContinue
+    }
 }
 
 # 3) `lmw` command
 $launcher = "@echo off`r`nchcp 65001 >nul`r`nset `"PYTHONUTF8=1`"`r`nset `"PYTHONPATH=$App;%PYTHONPATH%`"`r`n$py -m lmw %*`r`n"
-Set-Content -Path (Join-Path $Bin "lmw.cmd") -Value $launcher -Encoding ASCII
+try {
+    Set-Content -Path (Join-Path $Bin "lmw.cmd") -Value $launcher -Encoding ASCII
+} catch {
+    Write-Host "  ✘ lmw 명령 만들기 실패: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not (($userPath -split ";") -contains $Bin)) {
     [Environment]::SetEnvironmentVariable("Path", ($userPath.TrimEnd(";") + ";" + $Bin), "User")
