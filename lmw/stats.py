@@ -7,6 +7,7 @@ first token and response time. Uses exact counts from the server when it reports
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -67,16 +68,81 @@ class CallStats:
 
 
 @dataclass
+class Usage:
+    """Totals for ONE session (the terminal's, or one opened from the website)."""
+    started: float = field(default_factory=time.time)
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+    work_seconds: float = 0.0  # time spent working on requests (not idle time)
+    estimated: bool = False
+    last: Optional[CallStats] = None
+    turn_start: Optional[float] = None
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def begin_turn(self) -> None:
+        self.turn_start = time.time()
+
+    def end_turn(self) -> None:
+        if self.turn_start:
+            self.work_seconds += time.time() - self.turn_start
+        self.turn_start = None
+
+    @property
+    def busy_seconds(self) -> float:
+        return self.work_seconds + (time.time() - self.turn_start if self.turn_start else 0.0)
+
+    def line(self) -> str:
+        """Short per-session summary (shown on the website and after each turn)."""
+        approx = "~" if self.estimated else ""
+        return "이 세션: %s%s tok (입력 %s / 출력 %s) · 작업 %s · 호출 %d회" % (
+            approx, fmt_tokens(self.prompt_tokens + self.output_tokens), fmt_tokens(self.prompt_tokens),
+            fmt_tokens(self.output_tokens), fmt_duration(self.busy_seconds), self.calls)
+
+
+_tl = threading.local()  # per thread: the call in progress and the session it is billed to
+
+
+def bind(usage: Optional[Usage]) -> None:
+    """Bill model calls made by this thread to a session's Usage."""
+    _tl.usage = usage
+
+
+def bound() -> Optional[Usage]:
+    return getattr(_tl, "usage", None)
+
+
+@dataclass
 class Stats:
     session_start: float = field(default_factory=time.time)
     prompt_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
     estimated: bool = False
-    current: Optional[CallStats] = None
     last: Optional[CallStats] = None
     fields: List[str] = field(default_factory=lambda: list(ALL_FIELDS))
-    _buf: List[str] = field(default_factory=list)
+
+    # the call in progress belongs to the calling thread (sessions can run at the same time)
+    @property
+    def current(self) -> Optional[CallStats]:
+        return getattr(_tl, "current", None)
+
+    @current.setter
+    def current(self, c: Optional[CallStats]) -> None:
+        _tl.current = c
+
+    @property
+    def _buf(self) -> List[str]:
+        b = getattr(_tl, "buf", None)
+        if b is None:
+            b = _tl.buf = []
+        return b
+
+    @_buf.setter
+    def _buf(self, v: List[str]) -> None:
+        _tl.buf = v
 
     # ------------------------------------------------------------ recording
     def begin(self, messages: List[Dict[str, str]]) -> None:
@@ -118,6 +184,13 @@ class Stats:
         self.prompt_tokens += c.prompt_tokens
         self.output_tokens += c.output_tokens
         self.calls += 1
+        u = bound()
+        if u is not None:
+            u.prompt_tokens += c.prompt_tokens
+            u.output_tokens += c.output_tokens
+            u.calls += 1
+            u.estimated = u.estimated or not c.exact
+            u.last = c
         self.last, self.current = c, None
 
     def abort(self) -> None:

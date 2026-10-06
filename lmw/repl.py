@@ -178,6 +178,8 @@ class Shell:
         self.read = ui.read_line
         self.workers: List["Shell"] = []
         self.plan_next = False  # /plan without a request: the next request runs in plan mode
+        from .stats import Usage
+        self.usage = Usage()  # this session's own tokens and working time
 
     # ------------------------------------------------------------------ main
     bridge = None
@@ -227,6 +229,8 @@ class Shell:
             self.bridge.on_interrupt = self.stop_event.set
             self.bridge.on_control = self._remote_control
             self.bridge.on_new_session = self.open_web_session
+            self.bridge.main.usage = self.usage
+            self._publish_models()
         except Exception as e:
             self.bridge = None
             if not quiet:
@@ -578,7 +582,10 @@ class Shell:
         self.stop_event.clear()
         if self.bridge:
             self.bridge.channel(self.sid).running = True
-        t0, tin, tout = time.time(), STATS.prompt_tokens, STATS.output_tokens
+        from .stats import bind
+        bind(self.usage)  # model calls made for this turn are billed to this session
+        self.usage.begin_turn()
+        t0, tin, tout = time.time(), self.usage.prompt_tokens, self.usage.output_tokens
         try:
             if kind == "chat":
                 self._get_agent().chat(text)
@@ -600,9 +607,10 @@ class Shell:
         except Exception as e:  # a failing turn must never close lmw
             emit("error", text="%s: %s" % (type(e).__name__, e))
         finally:
+            self.usage.end_turn()
             if self.bridge:
                 self.bridge.channel(self.sid).running = False
-            emit("turn_end", stats=turn_stats(t0, tin, tout))
+            emit("turn_end", stats=turn_stats(t0, tin, tout, self.usage), session=self.usage.line())
 
     def ask_permission(self, req: Dict) -> str:
         """Ask the user (terminal or website) before an important action. Returns allow/always/deny."""
@@ -674,8 +682,34 @@ class Shell:
         emit("permission_result", id=req["id"], decision=decision, by="web" if src == "web" else "terminal")
         return decision
 
+    def _publish_models(self) -> None:
+        """Tell the website which models this computer's server has (for its model menu)."""
+        def run():
+            try:
+                models = self.client.list_models()
+            except Exception:
+                return
+            self._models = list(models)[:200]
+            if self.bridge:
+                self.bridge.set_meta(sid=self.sid, models=self._models, model=self.cfg.model)
+                for w in self.workers:
+                    self.bridge.set_meta(sid=w.sid, models=self._models)
+        threading.Thread(target=run, daemon=True).start()
+
     def _remote_control(self, action: str, value: str) -> None:
         from .events import emit
+        if action == "model" and value.strip():
+            name = value.strip()
+            self.cfg.model = name  # next model call uses it; the conversation is kept
+            if self.bridge:
+                self.bridge.set_meta(sid=self.sid, model=name)
+                if not self.background:
+                    self.bridge.model = name
+            emit("notice", level="info", text="모델 변경: %s" % name)
+            models = getattr(self, "_models", None) or []
+            if models and name not in models and not any(m.startswith(name + ":") for m in models):
+                emit("notice", level="warn", text="'%s' 은(는) 서버 모델 목록에 없습니다 — 이름을 확인하세요" % name)
+            return
         if action == "mode" and value in ("ask", "auto-edit", "full"):
             self.perms.mode = value
             if self.bridge:
@@ -693,6 +727,7 @@ class Shell:
         self.chat.clear()
         self.done_tasks.clear()
         self.titled = False
+        self.usage.reset()  # a new session starts counting from zero
         if self.bridge:
             try:
                 self.bridge.new_session()
@@ -711,14 +746,18 @@ class Shell:
         except Exception as e:
             ui.warn("웹 새 세션을 만들지 못했습니다: %s" % e)
             return
-        w = Shell(self.cfg, self.root, self.auth)
+        import copy
+        w = Shell(copy.copy(self.cfg), self.root, self.auth)  # own config + client: the web can switch its model
         w.bridge, w.sid, w.background = self.bridge, ch.sid, True
-        w.client = self.client
+        w.client = copy.copy(self.client)  # same server settings, but this session's own model
+        w.client.cfg = w.cfg
+        ch.usage = w.usage  # its own token/time totals
         w.perms.mode, w.effort, w.engine = self.perms.mode, self.effort, self.engine
         w.read = lambda prompt="": Bridge.read_channel(ch, prompt)
         ch.on_interrupt = w.stop_event.set
         ch.on_control = w._remote_control
-        self.bridge.set_meta(sid=ch.sid, mode=w.perms.mode, effort=w.effort)
+        self.bridge.set_meta(sid=ch.sid, mode=w.perms.mode, effort=w.effort, model=w.cfg.model,
+                             models=getattr(self, "_models", None))
         self.workers.append(w)
         with ui.remote_muted():
             print(ui.dim("\n⇢ [웹 세션] 웹에서 새 세션이 열렸습니다 (이 터미널은 그대로 사용하세요)"))
@@ -885,6 +924,9 @@ class Shell:
             return
         choice = models[int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(models) else ans
         self.cfg.model = choice
+        if self.bridge:
+            self.bridge.set_meta(sid=self.sid, model=choice)
+            self.bridge.model = choice
         ui.ok("model → %s" % choice)
         self._save_choice()
 

@@ -389,6 +389,7 @@ class Channel:
         self.last_state = None
         self.on_interrupt: Callable[[], None] = lambda: None
         self.on_control: Callable[[str, str], None] = lambda action, value: None
+        self.usage = None  # stats.Usage of the shell running this session (per-session tokens/time)
 
 
 class Bridge:
@@ -466,7 +467,7 @@ class Bridge:
             self.channels[ch.sid] = ch
             if not background:
                 if old is not None:
-                    ch.on_interrupt, ch.on_control = old.on_interrupt, old.on_control
+                    ch.on_interrupt, ch.on_control, ch.usage = old.on_interrupt, old.on_control, old.usage
                     old.closed = True  # the hub already marked it as history
                 self.main = ch
         if self._started:
@@ -521,11 +522,12 @@ class Bridge:
                 self._flush_log_locked(ch)
                 events, ch.events = ch.events, []
                 meta, ch.meta = ch.meta, {}
-            state = (STATS.line(), ch.prompt, ch.running)
+            status = ch.usage.line() if ch.usage is not None else STATS.line()
+            state = (status, ch.prompt, ch.running)
             if not events and not meta and state == ch.last_state and not ended:
                 continue
             body: Dict[str, object] = dict(meta)
-            body.update(events=events, status=STATS.line(), prompt=ch.prompt, running=ch.running, device=self.device)
+            body.update(events=events, status=status, prompt=ch.prompt, running=ch.running, device=self.device)
             if ended:
                 body["ended"] = True
             try:
@@ -557,7 +559,7 @@ class Bridge:
                 action, value = msg.get("action"), msg.get("value", "")
                 if action == "interrupt":
                     ch.on_interrupt()
-                elif action in ("mode", "effort"):
+                elif action in ("mode", "effort", "model"):
                     ch.on_control(action, value)
                 elif action == "permission":
                     ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))

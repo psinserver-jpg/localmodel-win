@@ -613,12 +613,14 @@ def _perm_title(name: str, args: Dict) -> str:
     return "%s 실행" % name
 
 
-def turn_stats(t0: float, before_in: int, before_out: int) -> str:
+def turn_stats(t0: float, before_in: int, before_out: int, usage=None) -> str:
+    """This turn's tokens/speed/time. With a session Usage, counts only this session's calls."""
+    src = usage if usage is not None else STATS
     dur = time.time() - t0
-    tin = STATS.prompt_tokens - before_in
-    tout = STATS.output_tokens - before_out
+    tin = src.prompt_tokens - before_in
+    tout = src.output_tokens - before_out
     speed = tout / dur if dur > 0 else 0
-    last = STATS.last
+    last = src.last
     if last and last.speed:
         speed = last.speed
     return "%s tok · %.1f tok/s · %.1f초" % (fmt_tokens(tin + tout), speed, dur)
