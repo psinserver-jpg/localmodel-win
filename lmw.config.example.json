@@ -1,0 +1,12 @@
+{
+  "provider": "ollama",
+  "base_url": "http://localhost:11434",
+  "model": "qwen2.5-coder:14b",
+  "context_tokens": 16384,
+  "max_output_tokens": 4096,
+  "temperature": 0.2,
+  "min_review_rounds": 2,
+  "max_review_rounds": 5,
+  "plan_rounds": 2,
+  "checks": []
+}
