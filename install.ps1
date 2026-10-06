@@ -68,16 +68,37 @@ try {
     Write-Host "  ✘ lmw 명령 만들기 실패: $($_.Exception.Message)" -ForegroundColor Red
     return
 }
+# Put our bin FIRST on the user PATH so an older `lmw` elsewhere can't shadow it
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (-not (($userPath -split ";") -contains $Bin)) {
-    [Environment]::SetEnvironmentVariable("Path", ($userPath.TrimEnd(";") + ";" + $Bin), "User")
+$parts = @($userPath -split ";" | Where-Object { $_ -and ($_.TrimEnd("\") -ne $Bin.TrimEnd("\")) })
+[Environment]::SetEnvironmentVariable("Path", (@($Bin) + $parts) -join ";", "User")
+$env:Path = "$Bin;" + $env:Path
+
+# Older lmw launchers elsewhere on PATH (earlier installs, pip) would still win from the system PATH:
+# turn them into forwarders to this install.
+$ours = Join-Path $Bin "lmw.cmd"
+foreach ($c in @(Get-Command lmw -All -ErrorAction SilentlyContinue)) {
+    $f = $c.Source
+    if (-not $f -or ((Resolve-Path $f).Path -eq (Resolve-Path $ours).Path)) { continue }
+    try {
+        if ($f -match "\.(cmd|bat)$") {
+            Copy-Item $f "$f.old" -Force
+            Set-Content -Path $f -Value "@echo off`r`ncall `"$ours`" %*`r`n" -Encoding ASCII
+            Write-Host "  · 예전 lmw 실행 파일을 새 버전으로 연결: $f" -ForegroundColor DarkGray
+        } elseif ($f -match "\.(exe|ps1)$") {
+            Move-Item $f "$f.old" -Force
+            Write-Host "  · 예전 lmw 실행 파일 비활성화: $f  (→ $f.old)" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host "  ! 예전 lmw 가 남아 있습니다: $f — 지우거나 이름을 바꾸세요" -ForegroundColor Yellow
+    }
 }
-$env:Path += ";$Bin"
 
 # Terminal window: Ghostty if installed (Windows builds are experimental), otherwise Windows Terminal
 if (-not (Get-Command ghostty -ErrorAction SilentlyContinue) -and -not (Get-Command wt -ErrorAction SilentlyContinue)) {
     Write-Host "  Windows Terminal 설치 중 (lmw 전용 테마 창)…" -ForegroundColor Yellow
     try { winget install -e --id Microsoft.WindowsTerminal --accept-source-agreements --accept-package-agreements | Out-Null } catch {}
 }
-Write-Host "  ✔ 설치 완료!" -ForegroundColor Green
+$ver = (Select-String -Path (Join-Path $App "lmw\__init__.py") -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+Write-Host "  ✔ 설치 완료! (v$ver · $App)" -ForegroundColor Green
 Write-Host "  새 터미널(cmd 또는 PowerShell)을 열고  lmw  를 입력하세요 (처음 실행 시 Google 로그인 → 모델 설정)." -ForegroundColor Green
