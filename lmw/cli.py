@@ -358,9 +358,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     ui.setup_console()
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
+    here = "--here" in argv  # stay in this window (don't open Ghostty / Windows Terminal)
+    argv = [a for a in argv if a != "--here"]
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
         argv = ["chat"] + argv  # `lmw` / `lmw -m qwen3` opens the interactive shell
     args = parser.parse_args(argv)
+    if args.command == "chat" and not here:
+        from .terminal import relaunch
+        try:
+            pref = load_config(getattr(args, "config", None)).terminal
+        except (OSError, ValueError):
+            pref = "auto"
+        if relaunch(argv[1:] if argv and argv[0] == "chat" else argv, pref):
+            return 0
     if not getattr(args, "func", None):
         parser.print_help()
         return 0

@@ -20,6 +20,8 @@ curl -fsSL https://raw.githubusercontent.com/psinserver-jpg/localmodel-win/main/
 ```
 lmw
 ```
+`lmw` 는 **[Ghostty](https://ghostty.org)** 창(LMW 전용 테마)에서 열립니다. Ghostty 가 없으면 Windows 에서는 같은 테마의 Windows Terminal 창으로 열립니다. 지금 창에서 쓰려면 `lmw --here`.
+
 1. **로그인** — [psin.ai.kr](https://psin.ai.kr) 링크가 열리면 **Google 로그인** → **[로그인 승인하기]**
 2. **모델 설정** — 실행 중인 서버(Ollama, LM Studio, vLLM 등)를 자동으로 찾아 줍니다 → 모델 선택
 3. **요청 입력** — 끝!
@@ -58,6 +60,7 @@ lmw ❯ calc.py 의 add 버그 고쳐줘
 | `Enter` · `/` | 메뉴 · 전체 명령 |
 
 파일 수정·명령 실행 전에는 물어봅니다: `y` 허용 · `a` 항상 허용 · `n` 거부.
+`lmw` 가 켜져 있으면 [psin.ai.kr](https://psin.ai.kr) 에서 **＋ 새 세션** 을 눌러 같은 lmw 안에 세션을 더 열 수 있습니다 (터미널 세션은 그대로).
 [psin.ai.kr](https://psin.ai.kr) 에 같은 Google 계정으로 로그인하면 세션별 대화, 생각/작업 펼쳐보기, 권한 승인, 프롬프트 보내기를 폰에서도 할 수 있습니다.
 
 ## 준비물

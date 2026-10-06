@@ -25,6 +25,32 @@ TOOL_LABELS = {
 }
 
 
+_ctx = threading.local()
+
+
+def set_context(session_id: str = "", background: bool = False, title: str = "") -> None:
+    """Bind events emitted by this thread to a session (used by sessions opened from the web)."""
+    _ctx.sid, _ctx.background, _ctx.title = session_id, background, title
+
+
+def _short(text: object, n: int = 50) -> str:
+    t = str(text or "").replace("\n", " ").strip()
+    return t[:n] + ("…" if len(t) > n else "")
+
+
+def render_background(e: Event) -> None:
+    """Terminal view of a web-opened session: one dim line per important moment."""
+    t, tag = e["type"], ui.dim("⇢ [웹 세션] ")
+    if t == "user":
+        print(tag + ui.dim("요청: " + _short(e.get("text"))))
+    elif t == "permission":
+        print(tag + ui.yellow("권한 요청 — 웹에서 승인하세요: " + _short(e.get("title"))))
+    elif t == "turn_end":
+        print(tag + ui.dim("완료 " + str(e.get("stats") or "")))
+    elif t == "error":
+        print(tag + ui.red(_short(e.get("text"), 80)))
+
+
 class EventBus:
     def __init__(self) -> None:
         self.sinks: List[Sink] = []
@@ -40,9 +66,15 @@ class EventBus:
 
     def emit(self, type_: str, **data) -> Event:
         e: Event = {"type": type_, "ts": time.time(), **data}
+        sid = getattr(_ctx, "sid", "")
+        if sid:
+            e["_sid"] = sid
         with self._lock:
             with ui.remote_muted():  # the website gets the structured event, not this printout
-                render(e, self.verbose)
+                if getattr(_ctx, "background", False):
+                    render_background(e)
+                else:
+                    render(e, self.verbose)
             for sink in list(self.sinks):
                 try:
                     sink(e)

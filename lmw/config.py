@@ -34,6 +34,7 @@ class Config:
     plan_rounds: int = 2  # max plan -> review cycles
     min_review_rounds: int = 2  # always do at least this many reviews of the result
     max_review_rounds: int = 5  # hard stop for review -> fix cycles
+    terminal: str = "auto"  # auto (Ghostty, else Windows Terminal) | ghostty | wt | none
     permission_mode: str = "ask"  # ask | auto-edit | full
     effort: str = "auto"  # auto | low | medium | high
     interactive: bool = True  # ask the user blocking questions after analysis

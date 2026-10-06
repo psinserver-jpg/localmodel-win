@@ -183,7 +183,8 @@ class Progress:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
-        if not verbose and sys.stdout.isatty():
+        # only the terminal's own session draws the live line (web-opened sessions run in worker threads)
+        if not verbose and sys.stdout.isatty() and threading.current_thread() is threading.main_thread():
             self._thread = threading.Thread(target=self._tick, daemon=True)
             self._thread.start()
 

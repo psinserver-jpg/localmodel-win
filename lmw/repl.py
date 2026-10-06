@@ -141,6 +141,10 @@ class Shell:
         self.pending: List[str] = []  # prompts that arrived while busy (e.g. typed on the web)
         self.agent = None
         self.titled = False
+        self.sid: Optional[str] = None  # None = the terminal's session; set for sessions opened from the web
+        self.background = False
+        self.read = ui.read_line
+        self.workers: List["Shell"] = []
 
     # ------------------------------------------------------------------ main
     bridge = None
@@ -165,6 +169,7 @@ class Shell:
                                  mode=self.perms.mode, effort=self.effort)
             self.bridge.on_interrupt = self.stop_event.set
             self.bridge.on_control = self._remote_control
+            self.bridge.on_new_session = self.open_web_session
         except Exception as e:
             ui.warn("Hub 연결 실패 (%s) — 이 컴퓨터에서만 작업합니다" % e)
             return
@@ -442,13 +447,13 @@ class Shell:
         emit("user", text=text)
         kind = route_override or route(text, self.effort)
         if self.bridge and not self.titled:
-            self.bridge.set_meta(title=text.strip().replace("\n", " ")[:60])
+            self.bridge.set_meta(sid=self.sid, title=text.strip().replace("\n", " ")[:60])
             self.titled = kind != "chat"  # small talk is only a placeholder title
         if kind == "agent" and self.engine == "aider" and not readonly:
             kind = "aider"
         self.stop_event.clear()
         if self.bridge:
-            self.bridge.running = True
+            self.bridge.channel(self.sid).running = True
         t0, tin, tout = time.time(), STATS.prompt_tokens, STATS.output_tokens
         try:
             if kind == "chat":
@@ -471,7 +476,7 @@ class Shell:
             emit("error", text=str(e))
         finally:
             if self.bridge:
-                self.bridge.running = False
+                self.bridge.channel(self.sid).running = False
             emit("turn_end", stats=turn_stats(t0, tin, tout))
 
     def ask_permission(self, req: Dict) -> str:
@@ -482,7 +487,7 @@ class Shell:
                    "always": "always", "n": "deny", "no": "deny", "ㅜ": "deny"}
         while True:
             try:
-                line = ui.read_line(ui.yellow("  허용할까요? [Y]es / [a]lways / [n]o > "))
+                line = self.read(ui.yellow("  허용할까요? [Y]es / [a]lways / [n]o > "))
             except EOFError:
                 line = "n"
             by = "terminal"
@@ -508,12 +513,12 @@ class Shell:
         if action == "mode" and value in ("ask", "auto-edit", "full"):
             self.perms.mode = value
             if self.bridge:
-                self.bridge.set_meta(mode=value)
+                self.bridge.set_meta(sid=self.sid, mode=value)
             emit("notice", level="info", text="권한 모드: %s" % MODE_LABELS[value])
         elif action == "effort" and value in ("auto", "low", "medium", "high"):
             self.effort = value
             if self.bridge:
-                self.bridge.set_meta(effort=value)
+                self.bridge.set_meta(sid=self.sid, effort=value)
             emit("notice", level="info", text="생각 수준: %s" % EFFORT_LABELS[value])
 
     def new_session(self) -> None:
@@ -528,6 +533,48 @@ class Shell:
             except Exception as e:
                 ui.warn("새 세션을 Hub 에 만들지 못했습니다: %s" % e)
         emit("notice", level="info", text="새 세션을 시작했습니다")
+
+    # ------------------------------------------------- sessions opened from the web
+    def open_web_session(self) -> None:
+        """'새 세션' on the website: host one more session in THIS process (like Claude Code)."""
+        from .remote_control import Bridge
+        if not self.bridge:
+            return
+        try:
+            ch = self.bridge.new_session(background=True)
+        except Exception as e:
+            ui.warn("웹 새 세션을 만들지 못했습니다: %s" % e)
+            return
+        w = Shell(self.cfg, self.root, self.auth)
+        w.bridge, w.sid, w.background = self.bridge, ch.sid, True
+        w.client = self.client
+        w.perms.mode, w.effort, w.engine = self.perms.mode, self.effort, self.engine
+        w.read = lambda prompt="": Bridge.read_channel(ch, prompt)
+        ch.on_interrupt = w.stop_event.set
+        ch.on_control = w._remote_control
+        self.bridge.set_meta(sid=ch.sid, mode=w.perms.mode, effort=w.effort)
+        self.workers.append(w)
+        with ui.remote_muted():
+            print(ui.dim("\n⇢ [웹 세션] 웹에서 새 세션이 열렸습니다 (이 터미널은 그대로 사용하세요)"))
+        threading.Thread(target=w.serve_channel, args=(ch,), daemon=True).start()
+
+    def serve_channel(self, ch) -> None:
+        from .events import set_context
+        set_context(ch.sid, background=True)
+        while not ch.closed:
+            text = self.pending.pop(0) if self.pending else self.read("")
+            if not text or text.startswith("\x00"):
+                continue  # late permission clicks / controls with nothing waiting
+            try:
+                if text.strip().startswith("/"):
+                    cmd = text.strip().split()[0]
+                    if cmd in ("/mode", "/effort") and len(text.split()) > 1:
+                        self._remote_control(cmd[1:], text.split()[1])
+                    continue  # other slash commands are terminal-only
+                self.handle(text.strip())
+            except Exception as e:  # never kill the worker thread
+                from .events import emit
+                emit("error", text="세션 오류: %s" % e)
 
     def task(self, request: str) -> None:
         ctx = "\n".join("- " + t for t in self.done_tasks[-5:])
@@ -562,10 +609,9 @@ class Shell:
         self.last_run = pipe
         pipe.run()
 
-    @staticmethod
-    def _ask_user(question: str) -> str:
+    def _ask_user(self, question: str) -> str:
         try:
-            return ui.read_line("  ? %s\n    > " % question)
+            return self.read("  ? %s\n    > " % question)
         except EOFError:
             return ""
 
@@ -591,7 +637,7 @@ class Shell:
                 summary = "+%d -%d" % (plus, minus)
             while True:
                 try:
-                    ans = ui.read_line("  %s %s (%s)  [Y]es / [n]o / [d]iff / [a]ll > " % (
+                    ans = self.read("  %s %s (%s)  [Y]es / [n]o / [d]iff / [a]ll > " % (
                         ui.bold("변경:"), b.path, summary)).strip().lower()
                 except EOFError:
                     ans = "y"

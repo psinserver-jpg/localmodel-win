@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from . import ui
 
@@ -297,11 +297,30 @@ PERM = "\x00perm:"  # inbox sentinels understood by the shell
 CTL = "\x00ctl:"
 
 
-class Bridge:
-    """Mirrors this lmw session to the user's Hub account (always on while logged in).
+class Channel:
+    """One hub session hosted by this lmw process (the terminal's, or one opened from the web)."""
 
-    - structured events (from events.BUS) + raw terminal output (as "log" events) go up
-    - prompts, permission answers and controls typed on the website come down
+    def __init__(self, sid: str, background: bool):
+        self.sid = sid
+        self.background = background
+        self.inbox: "queue.Queue" = queue.Queue()
+        self.events: List[Dict] = []
+        self.log: List[str] = []
+        self.meta: Dict[str, object] = {}
+        self.prompt = ""
+        self.running = False
+        self.closed = False
+        self.last_state = None
+        self.on_interrupt: Callable[[], None] = lambda: None
+        self.on_control: Callable[[str, str], None] = lambda action, value: None
+
+
+class Bridge:
+    """Mirrors this lmw process to the user's Hub account (always on while logged in).
+
+    One process can host several sessions, like Claude Code: the terminal's own session plus any
+    sessions opened from the website ("새 세션"), each with its own conversation and inbox.
+    Only what lmw generates (structured events) is sent — the terminal screen is not scraped.
     """
 
     def __init__(self, auth: Dict[str, str], name: str, cwd: str, model: str,
@@ -309,54 +328,95 @@ class Bridge:
         self.relay = (auth.get("relay") or auth["hub"]).rstrip("/")
         self.token = auth["token"]
         self.email = auth.get("user") or auth.get("email", "")
-        self.inbox: "queue.Queue" = queue.Queue()
         self.cwd, self.model, self.mode, self.effort = cwd, model, mode, effort
         self.device = "%s:%d" % (socket.gethostname(), os.getpid())
-        self._events: List[Dict] = []
-        self._log: List[str] = []
-        self._meta: Dict[str, object] = {}
+        self.channels: Dict[str, Channel] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._prompt = ""
+        self._started = False
         self._pending_line = ""
-        self.running = False
         self.mirror_terminal = False
-        self.on_interrupt = lambda: None
-        self.on_control = lambda action, value: None
-        self.session_id = ""
-        self.new_session()
+        self.on_new_session: Callable[[], None] = lambda: None  # set by the shell
+        self.main: Channel = self.new_session()
         self._orig_out, self._orig_err = sys.stdout, sys.stderr
 
+    # ------------------------------------------------- main-session shortcuts
     @property
     def url(self) -> str:
         return self.relay + "/"
 
-    def new_session(self, title: str = "") -> str:
-        self.flush()
+    @property
+    def session_id(self) -> str:
+        return self.main.sid
+
+    @property
+    def inbox(self) -> "queue.Queue":
+        return self.main.inbox
+
+    @property
+    def running(self) -> bool:
+        return self.main.running
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        self.main.running = value
+
+    @property
+    def on_interrupt(self):
+        return self.main.on_interrupt
+
+    @on_interrupt.setter
+    def on_interrupt(self, fn) -> None:
+        self.main.on_interrupt = fn
+
+    @property
+    def on_control(self):
+        return self.main.on_control
+
+    @on_control.setter
+    def on_control(self, fn) -> None:
+        self.main.on_control = fn
+
+    # ---------------------------------------------------------- sessions
+    def new_session(self, title: str = "", background: bool = False) -> Channel:
+        """background=False: the terminal moves to a fresh session. True: one more session (from the web)."""
         _, d = _req("POST", self.relay + "/api/sessions", {
             "host": socket.gethostname(), "cwd": self.cwd, "model": self.model, "title": title,
-            "mode": self.mode, "effort": self.effort, "device": self.device}, self.token)
+            "mode": self.mode, "effort": self.effort, "device": self.device, "background": background}, self.token)
+        ch = Channel(d["id"], background)
+        old = getattr(self, "main", None)
         with self._lock:
-            self.session_id = d["id"]
-            self._events, self._log = [], []
-        return self.session_id
+            self.channels[ch.sid] = ch
+            if not background:
+                if old is not None:
+                    ch.on_interrupt, ch.on_control = old.on_interrupt, old.on_control
+                    old.closed = True  # the hub already marked it as history
+                self.main = ch
+        if self._started:
+            threading.Thread(target=self._input_loop, args=(ch,), daemon=True).start()
+        return ch
+
+    def channel(self, sid: Optional[str]) -> Channel:
+        return self.channels.get(sid or "", self.main)
 
     # ------------------------------------------------------------- output
     def event(self, e: Dict) -> None:
-        """events.BUS sink."""
+        """events.BUS sink: route the event to its session."""
+        e = dict(e)
+        ch = self.channel(e.pop("_sid", None))
         with self._lock:
-            self._flush_log_locked()
-            self._events.append(dict(e))
+            self._flush_log_locked(ch)
+            ch.events.append(e)
 
-    def set_meta(self, **kw) -> None:
+    def set_meta(self, sid: Optional[str] = None, **kw) -> None:
+        ch = self.channel(sid)
         with self._lock:
-            self._meta.update({k: v for k, v in kw.items() if v is not None})
-            if "mode" in kw:
-                self.mode = kw["mode"]
-            if "effort" in kw:
-                self.effort = kw["effort"]
+            ch.meta.update({k: v for k, v in kw.items() if v is not None})
+            if not ch.background:
+                self.mode = kw.get("mode", self.mode)
+                self.effort = kw.get("effort", self.effort)
 
-    def capture(self, s: str) -> None:
+    def capture(self, s: str) -> None:  # only used when mirror_terminal=True
         if not s:
             return
         with self._lock:
@@ -366,54 +426,48 @@ class Bridge:
             for line in lines:
                 if "\r" in line:
                     line = line.rsplit("\r", 1)[-1]
-                self._log.append(_ANSI.sub("", line))
-            if "\r" in self._pending_line:
-                self._pending_line = self._pending_line.rsplit("\r", 1)[-1]
+                self.main.log.append(_ANSI.sub("", line))
 
-    def _flush_log_locked(self) -> None:
-        lines = [l for l in self._log if l.strip()]
+    @staticmethod
+    def _flush_log_locked(ch: Channel) -> None:
+        lines = [l for l in ch.log if l.strip()]
         if lines:
-            self._events.append({"type": "log", "text": "\n".join(lines), "ts": time.time()})
-        self._log = []
+            ch.events.append({"type": "log", "text": "\n".join(lines), "ts": time.time()})
+        ch.log = []
 
-    def flush(self, ended: bool = False) -> None:
+    def flush(self, ended: bool = False, only: Optional[Channel] = None) -> None:
         from .stats import STATS
-        if not self.session_id:
-            return
-        with self._lock:
-            self._flush_log_locked()
-            events, self._events = self._events, []
-            meta, self._meta = self._meta, {}
-            sid = self.session_id
-        body: Dict[str, object] = dict(meta)
-        body.update(events=events, status=STATS.line(), prompt=self._prompt, running=self.running, device=self.device)
-        if ended:
-            body["ended"] = True
-        try:
-            _req("POST", "%s/api/sessions/%s/events" % (self.relay, sid), body, self.token, timeout=15)
-        except (urllib.error.URLError, OSError):
-            with self._lock:  # keep and retry next tick
-                if sid == self.session_id:
-                    self._events = events + self._events
-                    self._meta = dict(meta, **self._meta)
+        for ch in [only] if only else list(self.channels.values()):
+            if ch.closed and not ended:
+                continue
+            with self._lock:
+                self._flush_log_locked(ch)
+                events, ch.events = ch.events, []
+                meta, ch.meta = ch.meta, {}
+            state = (STATS.line(), ch.prompt, ch.running)
+            if not events and not meta and state == ch.last_state and not ended:
+                continue
+            body: Dict[str, object] = dict(meta)
+            body.update(events=events, status=STATS.line(), prompt=ch.prompt, running=ch.running, device=self.device)
+            if ended:
+                body["ended"] = True
+            try:
+                _req("POST", "%s/api/sessions/%s/events" % (self.relay, ch.sid), body, self.token, timeout=15)
+                ch.last_state = state
+            except (urllib.error.URLError, OSError):
+                with self._lock:  # keep and retry next tick
+                    ch.events = events + ch.events
+                    ch.meta = dict(meta, **ch.meta)
 
     def _flush_loop(self) -> None:
-        last = None
         while not self._stop.wait(0.4):
-            from .stats import STATS
-            state = (STATS.line(), self._prompt, self.running)
-            with self._lock:
-                pending = bool(self._events or self._log or self._meta)
-            if pending or state != last:
-                self.flush()
-                last = state
+            self.flush()
 
     # -------------------------------------------------------------- input
-    def _input_loop(self) -> None:
-        while not self._stop.is_set():
-            sid = self.session_id
+    def _input_loop(self, ch: Channel) -> None:
+        while not self._stop.is_set() and not ch.closed:
             try:
-                _, d = _req("GET", "%s/api/sessions/%s/input" % (self.relay, sid), token=self.token, timeout=35)
+                _, d = _req("GET", "%s/api/sessions/%s/input" % (self.relay, ch.sid), token=self.token, timeout=35)
             except (urllib.error.URLError, OSError):
                 self._stop.wait(3)
                 continue
@@ -421,36 +475,38 @@ class Bridge:
                 if isinstance(msg, str):  # older hubs
                     msg = {"kind": "prompt", "text": msg}
                 if msg.get("kind") == "prompt":
-                    self.inbox.put(("web", str(msg.get("text", ""))))
+                    ch.inbox.put(("web", str(msg.get("text", ""))))
                     continue
                 action, value = msg.get("action"), msg.get("value", "")
                 if action == "interrupt":
-                    self.on_interrupt()
+                    ch.on_interrupt()
                 elif action in ("mode", "effort"):
-                    self.on_control(action, value)
+                    ch.on_control(action, value)
                 elif action == "permission":
-                    self.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
+                    ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
                 elif action == "new_session":
-                    self.inbox.put(("web", CTL + "new_session"))
+                    threading.Thread(target=self.on_new_session, daemon=True).start()
 
     def _keyboard_loop(self) -> None:
         while not self._stop.is_set():
             line = sys.stdin.readline()
             if line == "":  # EOF
-                self.inbox.put(("eof", ""))
+                self.main.inbox.put(("eof", ""))
                 return
-            self.inbox.put(("key", line.rstrip("\r\n")))
+            self.main.inbox.put(("key", line.rstrip("\r\n")))
 
     def read_line(self, prompt: str = "") -> str:
+        """Terminal session input: keyboard or the website, whichever comes first."""
         with ui.remote_muted():
             sys.stdout.write(prompt)
             sys.stdout.flush()
+        ch = self.main
         # a permission question is already shown on the web as a card with buttons
-        self._prompt = "" if "[a]lways" in prompt else _ANSI.sub("", prompt).strip()
+        ch.prompt = "" if "[a]lways" in prompt else _ANSI.sub("", prompt).strip()
         try:
-            source, text = self.inbox.get()
+            source, text = ch.inbox.get()
         finally:
-            self._prompt = ""
+            ch.prompt = ""
         if source == "eof":
             raise EOFError
         if source == "web" and not text.startswith("\x00"):
@@ -459,19 +515,30 @@ class Bridge:
                 sys.stdout.flush()
         return text
 
+    @staticmethod
+    def read_channel(ch: Channel, prompt: str = "") -> str:
+        """Input for a web-opened session (no keyboard)."""
+        ch.prompt = "" if "[a]lways" in prompt else _ANSI.sub("", prompt).strip()
+        try:
+            source, text = ch.inbox.get()
+        finally:
+            ch.prompt = ""
+        return text
+
     # ---------------------------------------------------------- lifecycle
     def start(self, keyboard: bool = True) -> None:
-        # Only what lmw generates (structured events) is sent — the terminal screen itself is NOT
-        # scraped. Set mirror_terminal=True to also send raw terminal text as "log" events.
         from .events import BUS
         if self.mirror_terminal:
             sys.stdout = _Tee(self._orig_out, self)
             sys.stderr = _Tee(self._orig_err, self)
         ui.set_input_hook(self.read_line)
         BUS.subscribe(self.event)
-        targets = [self._flush_loop, self._input_loop] + ([self._keyboard_loop] if keyboard else [])
-        for target in targets:
-            threading.Thread(target=target, daemon=True).start()
+        self._started = True
+        targets = [(self._flush_loop, ())] + [(self._input_loop, (ch,)) for ch in self.channels.values() if not ch.closed]
+        if keyboard:
+            targets.append((self._keyboard_loop, ()))
+        for target, args in targets:
+            threading.Thread(target=target, args=args, daemon=True).start()
 
     def stop(self) -> None:
         from .events import BUS
@@ -480,5 +547,7 @@ class Bridge:
         ui.set_input_hook(None)
         if self.mirror_terminal:
             sys.stdout, sys.stderr = self._orig_out, self._orig_err
-        self.running = False
-        self.flush(ended=True)
+        for ch in list(self.channels.values()):
+            ch.running = False
+            if not ch.closed:
+                self.flush(ended=True, only=ch)

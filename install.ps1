@@ -71,5 +71,10 @@ if (-not (($userPath -split ";") -contains $Bin)) {
 }
 $env:Path += ";$Bin"
 
+# Terminal window: Ghostty if installed (Windows builds are experimental), otherwise Windows Terminal
+if (-not (Get-Command ghostty -ErrorAction SilentlyContinue) -and -not (Get-Command wt -ErrorAction SilentlyContinue)) {
+    Write-Host "  Windows Terminal 설치 중 (lmw 전용 테마 창)…" -ForegroundColor Yellow
+    try { winget install -e --id Microsoft.WindowsTerminal --accept-source-agreements --accept-package-agreements | Out-Null } catch {}
+}
 Write-Host "  ✔ 설치 완료!" -ForegroundColor Green
 Write-Host "  새 터미널(cmd 또는 PowerShell)을 열고  lmw  를 입력하세요 (처음 실행 시 Google 로그인 → 모델 설정)." -ForegroundColor Green

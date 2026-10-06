@@ -39,4 +39,16 @@ case ":$PATH:" in
      done
      echo "  (새 터미널을 열어야 lmw 명령이 잡힙니다)";;
 esac
+# Ghostty: lmw opens in its own themed Ghostty window (https://ghostty.org)
+if [ "$(uname)" = "Darwin" ]; then
+  if [ ! -d /Applications/Ghostty.app ] && [ ! -d "$HOME/Applications/Ghostty.app" ]; then
+    if command -v brew >/dev/null 2>&1; then
+      echo "  Ghostty 설치 중 (brew)…"; brew install --cask ghostty >/dev/null 2>&1 || echo "  (Ghostty 설치 실패 — https://ghostty.org 에서 직접 설치하세요)"
+    else
+      echo "  Ghostty 를 쓰려면 https://ghostty.org 에서 설치하세요 (없으면 지금 터미널에서 실행됩니다)"
+    fi
+  fi
+elif ! command -v ghostty >/dev/null 2>&1; then
+  echo "  Ghostty 를 쓰려면 배포판 패키지로 설치하세요: https://ghostty.org/docs/install/binary (없으면 지금 터미널에서 실행됩니다)"
+fi
 echo "  ✔ 설치 완료!  lmw  를 입력하세요 (처음 실행 시 로그인 → 모델 설정)."
