@@ -445,7 +445,8 @@ class Bridge:
         with ui.remote_muted():
             sys.stdout.write(prompt)
             sys.stdout.flush()
-        self._prompt = _ANSI.sub("", prompt).strip()
+        # a permission question is already shown on the web as a card with buttons
+        self._prompt = "" if "[a]lways" in prompt else _ANSI.sub("", prompt).strip()
         try:
             source, text = self.inbox.get()
         finally:
