@@ -52,10 +52,26 @@ _SMALLTALK = re.compile(
     r"^\s*(안녕|하이|ㅎㅇ|반가워|고마워|감사|땡큐|수고|잘\s*자|좋은\s*(아침|하루)|hi|hello|hey|yo|thanks?|thank you|"
     r"good (morning|night)|ok|okay|ㅇㅋ|오케이|넵|네|응|ㅋ+|ㅎ+)[\s!.?~ㅎㅋ^]*$", re.I)
 _TECH = re.compile(r"(파일|폴더|코드|함수|클래스|프로젝트|에러|오류|버그|만들|고쳐|수정|실행|설치|빌드|테스트|배포|"
+                   r"요약|읽어|보여|찾아|열어|분석|설명해|readme|summar|"
                    r"file|code|error|bug|build|run|fix|install|test|deploy|\.\w{1,5}\b|/|\\)", re.I)
 _BUILD_VERB = re.compile(r"(만들어|만들자|제작|개발해|구현해|짜줘|build|create|make|develop)", re.I)
 _BUILD_NOUN = re.compile(r"(웹사이트|홈페이지|사이트|웹앱|앱|어플|게임|랜딩|대시보드|쇼핑몰|포트폴리오|프로젝트|서비스|"
                          r"website|web app|app|game|landing|dashboard|portfolio|project)", re.I)
+
+
+_CODE_TASK = re.compile(
+    r"(코드|코딩|함수|클래스|메서드|모듈|스크립트|프로그램|구현|작성해|짜줘|짜 줘|만들어|고쳐|수정해|바꿔|추가해|삭제해|리팩|"
+    r"버그|에러|오류|디버그|테스트 (작성|추가)|최적화|마이그레이션|"
+    r"implement|write|refactor|fix|debug|add|create|build|optimi[sz]e|migrate|code|function|class|script)", re.I)
+
+
+def wants_thinking(text: str, effort: str) -> bool:
+    """Only real code work thinks; questions and simple requests answer directly (effort=auto)."""
+    if effort == "high":
+        return True
+    if effort == "low":
+        return False
+    return bool(_CODE_TASK.search(text))
 
 
 def route(text: str, effort: str) -> str:
@@ -425,7 +441,8 @@ When the work is finished, or for conversation, reply WITHOUT any tool call.
 {skills}"""
 
 EFFORT_RULES = {
-    "low": "- Be quick: minimal reasoning, as few tool calls as possible.",
+    "none": "- Answer directly. Do NOT think out loud and do not write <think> blocks; use tools only if you must look something up.",
+    "low": "- Be quick: minimal reasoning, as few tool calls as possible. Do not write <think> blocks.",
     "medium": "- Think inside <think>...</think> only when the task is genuinely complex; keep it short. Simple requests: act or answer immediately.",
     "high": "- Before acting, plan inside <think>...</think>: goal, steps, risks. Before finishing, review your result against the request.",
 }
@@ -515,14 +532,15 @@ class Agent:
 
     def run(self, text: str, effort: str = "medium", readonly: bool = False) -> str:
         if effort == "auto":
-            effort = "medium"
+            effort = "medium" if wants_thinking(text, "auto") else "none"
+        think = None if effort in ("medium", "high") else False  # simple requests: model's thinking off
         self.history.append({"role": "user", "content": text})
         final = ""
         for step in range(MAX_STEPS):
             self.check_stop()
             system = self._system(text, effort, readonly)
             t0 = time.time()
-            raw, finish = self._call(self._fit(system), lambda s: None)
+            raw, finish = self._call(self._fit(system), lambda s: None, think=think)
             thinking, visible = split_thinking(raw)
             if thinking:
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))
