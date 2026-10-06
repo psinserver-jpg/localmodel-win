@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.lmw/
+lmw.config.json
+.venv/
+*.egg-info/
