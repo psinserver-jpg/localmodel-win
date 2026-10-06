@@ -320,6 +320,7 @@ class Bridge:
         self._prompt = ""
         self._pending_line = ""
         self.running = False
+        self.mirror_terminal = False
         self.on_interrupt = lambda: None
         self.on_control = lambda action, value: None
         self.session_id = ""
@@ -459,9 +460,12 @@ class Bridge:
 
     # ---------------------------------------------------------- lifecycle
     def start(self, keyboard: bool = True) -> None:
+        # Only what lmw generates (structured events) is sent — the terminal screen itself is NOT
+        # scraped. Set mirror_terminal=True to also send raw terminal text as "log" events.
         from .events import BUS
-        sys.stdout = _Tee(self._orig_out, self)
-        sys.stderr = _Tee(self._orig_err, self)
+        if self.mirror_terminal:
+            sys.stdout = _Tee(self._orig_out, self)
+            sys.stderr = _Tee(self._orig_err, self)
         ui.set_input_hook(self.read_line)
         BUS.subscribe(self.event)
         targets = [self._flush_loop, self._input_loop] + ([self._keyboard_loop] if keyboard else [])
@@ -473,6 +477,7 @@ class Bridge:
         BUS.unsubscribe(self.event)
         self._stop.set()
         ui.set_input_hook(None)
-        sys.stdout, sys.stderr = self._orig_out, self._orig_err
+        if self.mirror_terminal:
+            sys.stdout, sys.stderr = self._orig_out, self._orig_err
         self.running = False
         self.flush(ended=True)

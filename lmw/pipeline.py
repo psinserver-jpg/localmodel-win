@@ -340,7 +340,8 @@ class Pipeline:
             issues = [i for i in parse_issues(review) if i.severity in ("critical", "major")]
             missing = [l for l in list_items(get_section(review, "coverage")) if "missing" in l.lower()]
             if verdict == "PASS" and not issues and not missing:
-                ui.ok("plan approved")
+                from .events import emit
+                emit("notice", level="info", text="계획 승인")
                 break
             if r >= self.cfg.plan_rounds:
                 ui.warn("plan still has open issues after %d rounds; continuing with the latest plan" % r)
@@ -392,7 +393,7 @@ class Pipeline:
                 parsed = parse_file_blocks(out)
             changed, problems = self._apply(parsed.blocks)
             for c in changed:
-                ui.ok("wrote " + c)
+                _file_event("Write", c)
             for p in problems:
                 ui.warn(p)
             self.state["pending_problems"] += problems
@@ -443,11 +444,12 @@ class Pipeline:
             self.save()
             for i in issues[:12]:
                 ui.info(str(i)[:140])
+            from .events import emit
             if passed:
-                ui.ok("round %d: PASS" % r)
+                emit("notice", level="info", text="검토 %d차: 통과" % r)
             else:
-                ui.warn("round %d: FAIL (%d blocking issues, %d failed criteria, %d check errors)" % (
-                    r, len(blocking), len(fails), n_err))
+                emit("notice", level="warn", text="검토 %d차: 수정 필요 — 중요 문제 %d개, 미충족 기준 %d개, 자동검사 오류 %d개"
+                     % (r, len(blocking), len(fails), n_err))
 
             if passed and r >= self.cfg.min_review_rounds:
                 break
@@ -491,7 +493,7 @@ class Pipeline:
         parsed = parse_file_blocks(out)
         changed, problems = self._apply(parsed.blocks)
         for c in changed:
-            ui.ok("updated " + c)
+            _file_event("Edit", c)
         for p in problems:
             ui.warn(p)
         if not parsed.blocks:
@@ -529,6 +531,15 @@ class Pipeline:
 
 
 # ------------------------------------------------------------------- helpers
+
+def _file_event(label: str, path: str) -> None:
+    """Deep mode writes files directly; report them as structured tool events (shown on the web)."""
+    from .events import emit
+    tid = "f%d_%s" % (int(time.time() * 1000), path)
+    emit("tool", id=tid, name="write_file" if label == "Write" else "edit_file", title="%s(%s)" % (label, path),
+         input={"path": path})
+    emit("tool_result", id=tid, ok=True, summary="저장됨")
+
 
 def _merge_continuation(prev: str, new: str) -> str:
     """Join a continuation, removing a repeated overlap at the seam."""
