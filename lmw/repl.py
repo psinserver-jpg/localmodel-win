@@ -14,6 +14,8 @@ import threading
 import time
 import re
 import shutil
+import os
+import sys
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -61,6 +63,7 @@ COMMANDS = [
     ("/config", "현재 설정 보기", "설정"),
     ("/watch", "다른 컴퓨터의 lmw 화면 보기·조작", "계정"),
     ("/web", "이 화면을 웹에서 보는 주소", "계정"),
+    ("/update", "lmw 최신 버전으로 업데이트 (자동 재시작)", "계정"),
     ("/logout", "로그아웃", "계정"),
     ("/help", "도움말", "기타"),
     ("/exit", "종료", "기타"),
@@ -86,6 +89,35 @@ MODE_HINTS = {"ask": "파일 수정·명령 실행 전에 물어봄", "auto-edit
 EFFORT_LABELS = {"auto": "자동", "low": "빠르게", "medium": "보통", "high": "깊게"}
 EFFORT_HINTS = {"auto": "요청 크기에 맞춰 자동 선택", "low": "최소한으로 생각", "medium": "필요할 때만 생각",
                 "high": "큰 작업은 8단계(생각·계획·검토)로"}
+
+
+def _ensure_prompt_toolkit() -> None:
+    """The Claude-Code-style input box needs prompt_toolkit; install it once if it is missing."""
+    from . import tui
+    if tui.HAVE_PT or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    marker = Path(os.environ.get("LMW_HOME") or (Path.home() / ".lmw")) / ".prompt_toolkit-tried"
+    if marker.exists():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+    ui.info(ui.dim("입력 화면 구성요소(prompt_toolkit) 설치 중… (처음 한 번)"))
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--quiet", "--disable-pip-version-check",
+                        "prompt_toolkit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        import importlib
+        import site
+        site.addsitedir(site.getusersitepackages())
+        importlib.invalidate_caches()
+        importlib.reload(tui)
+    except Exception:
+        pass
+    if not tui.HAVE_PT:
+        ui.warn("prompt_toolkit 설치 실패 — 기본 입력으로 실행합니다 (직접 설치: %s -m pip install prompt_toolkit)"
+                % Path(sys.executable).name)
 
 
 def _setup_completion() -> None:
@@ -151,6 +183,9 @@ class Shell:
 
     def loop(self) -> int:
         _setup_completion()
+        _ensure_prompt_toolkit()
+        from . import updater
+        updater.check_in_background()
         self._setup_tui()
         self._banner()
         self.connect_hub()
@@ -197,8 +232,7 @@ class Shell:
                 ui.warn("Hub 연결 실패 (%s) — 이 컴퓨터에서 작업하며, 연결되면 자동으로 다시 붙습니다" % e)
             return
         self.bridge.start()
-        ui.ok("이 화면이 실시간으로 공유됩니다 — 웹(%s) 또는 다른 컴퓨터의 lmw(/watch)에서 %s 계정으로 보기·입력"
-              % (self.auth["hub"], self.auth.get("user", "")))
+        ui.info(ui.dim("● 원격 연결됨 — %s 에서 이 세션 보기·입력" % self.auth["hub"].replace("https://", "")))
 
     def disconnect_hub(self) -> None:
         if self.bridge:
@@ -250,6 +284,10 @@ class Shell:
                     print()
                     from . import tui
                     if not tui.available():
+                        from . import updater
+                        if updater.latest and not getattr(self, "_told_update", False):
+                            self._told_update = True
+                            ui.info(ui.yellow("새 버전 v%s 이 있습니다 — /update 로 업데이트" % updater.latest))
                         ui.status()
                     line = ui.read_line(ui.prompt_label("lmw") + " ", main=True).strip()
             except EOFError:
@@ -265,6 +303,9 @@ class Shell:
             if line.startswith(PERM_PREFIX):
                 continue  # a late permission click; nothing is waiting for it
             if not line:
+                from . import tui
+                if tui.available():
+                    continue  # like Claude Code: an empty Enter does nothing
                 line = self.home_menu() or ""
             elif line == "/":
                 line = self.command_menu() or ""
@@ -303,6 +344,9 @@ class Shell:
                        ("class:hint", " (shift+tab 전환)")]
             if self.effort != "auto":
                 out.append(("class:hint", " · 생각: " + EFFORT_LABELS.get(self.effort, self.effort)))
+            from . import updater
+            if updater.latest:
+                out.append(("class:mode", " · 새 버전 v%s → /update" % updater.latest))
             return out
 
         def shift_tab():
@@ -466,6 +510,14 @@ class Shell:
                 ui.box("웹에서 보기", [self.auth["hub"], "같은 계정으로 로그인하면 이 컴퓨터가 보입니다"])
             else:
                 ui.warn("로그인되어 있지 않습니다")
+        elif cmd == "/update":
+            from . import updater
+            if updater.update():
+                ui.info("새 버전으로 다시 시작합니다…")
+                for w in self.workers:
+                    w.stop_event.set()
+                self.disconnect_hub()
+                updater.restart()
         elif cmd == "/logout":
             from .remote_control import logout
             self.disconnect_hub()

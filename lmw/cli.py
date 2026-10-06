@@ -250,7 +250,7 @@ def cmd_init(args) -> int:
     return 0
 
 
-NO_LOGIN = {"login", "logout"}  # everything else requires a logged-in account
+NO_LOGIN = {"login", "logout", "update"}  # everything else requires a logged-in account
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,6 +320,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     lo = sub.add_parser("logout", help="log out this computer")
     lo.set_defaults(func=cmd_logout)
+
+    up = sub.add_parser("update", help="update lmw to the latest version")
+    up.set_defaults(func=lambda a: 0 if __import__("lmw.updater", fromlist=["update"]).update() else 1)
 
     wt = sub.add_parser("watch", help="show the live lmw screen of another computer on your account")
     wt.set_defaults(func=cmd_watch)

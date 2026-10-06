@@ -68,6 +68,7 @@ Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **Shift+Ta
 | `/effort` | 생각 수준: 자동 · 빠르게 · 보통 · 깊게 |
 | `/new` | 새 세션 |
 | `/undo` · `/model` | 되돌리기 · 모델 바꾸기 |
+| `/update` | 최신 버전으로 업데이트 후 자동 재시작 (밖에서는 `lmw update`) |
 | `/` · `Shift+Tab` · `Alt+Enter` | 명령 자동완성 · 권한 모드 전환 · 줄바꿈 |
 
 `lmw` 가 켜져 있으면 [psin.ai.kr](https://psin.ai.kr) 에서 **＋ 새 세션** 을 눌러 같은 lmw 안에 세션을 더 열 수 있습니다 (터미널 세션은 그대로).
