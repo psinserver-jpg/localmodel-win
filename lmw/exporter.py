@@ -38,3 +38,38 @@ def build_prompt(cfg: Config, names: List[str], compact: bool = False, reference
     if budget and estimate_tokens(text) > budget:
         text = truncate_to_tokens(text, budget)
     return text
+
+
+COMMANDS = [
+    # (command, title, skills)
+    ("lmw", "LMW: 완수 프로토콜 (생각→계획→구현→검토/수정 반복)", []),
+    ("lmw-web", "LMW: 웹사이트 디자인 + 완수 프로토콜", ["web-design"]),
+    ("lmw-code", "LMW: 코딩/디버깅 + 완수 프로토콜", ["coding", "debugging"]),
+]
+
+REQUEST_HEADER = "\n\n---\n\n# USER REQUEST (apply the protocol above to this request)\n\n"
+
+
+def build_commands(cfg: Config, out_dir) -> List[str]:
+    """Write slash-command files: Open WebUI import JSON + Markdown commands for agent CLIs."""
+    import json
+    import time
+    from pathlib import Path
+
+    out = Path(out_dir)
+    (out / "commands").mkdir(parents=True, exist_ok=True)
+    written = []
+    owui = []
+    for command, title, skills in COMMANDS:
+        body = build_prompt(cfg, skills or ["core-workflow"], compact=True)
+        # Open WebUI: typing /lmw inserts this text; the user types the request after it.
+        owui.append({"command": "/" + command, "title": title, "content": body + REQUEST_HEADER,
+                     "timestamp": int(time.time())})
+        # Agent CLIs that read commands/<name>.md and substitute $ARGUMENTS.
+        md = out / "commands" / (command + ".md")
+        md.write_text("---\ndescription: %s\n---\n%s%s$ARGUMENTS\n" % (title, body, REQUEST_HEADER), encoding="utf-8")
+        written.append(str(md))
+    j = out / "openwebui-prompts.json"
+    j.write_text(json.dumps(owui, ensure_ascii=False, indent=2), encoding="utf-8")
+    written.insert(0, str(j))
+    return written

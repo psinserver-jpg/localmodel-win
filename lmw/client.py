@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from .config import Config
+from .stats import STATS
 
 Message = Dict[str, str]
 TokenCallback = Optional[Callable[[str], None]]
@@ -31,6 +32,7 @@ class ModelError(RuntimeError):
 class ChatResult:
     text: str
     finish_reason: str  # "stop", "length", or provider-specific
+    usage: Optional[Dict[str, float]] = None  # prompt_tokens, completion_tokens, gen_seconds
 
     @property
     def truncated(self) -> bool:
@@ -50,9 +52,30 @@ def strip_reasoning(text: str) -> str:
     return text.strip("\n")
 
 
+def _peek(err: urllib.error.HTTPError) -> str:
+    try:
+        body = err.read().decode("utf-8", errors="replace")[:1000]
+    except Exception:
+        body = ""
+    err.read = lambda *a, **k: body.encode()  # keep it readable for later error messages
+    return body
+
+
+def _merge_system_messages(messages: List[Message]) -> List[Message]:
+    sys_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    rest = [dict(m) for m in messages if m["role"] != "system"]
+    if sys_text and rest and rest[0]["role"] == "user":
+        rest[0]["content"] = sys_text + "\n\n---\n\n" + rest[0]["content"]
+    elif sys_text:
+        rest.insert(0, {"role": "user", "content": sys_text})
+    return rest
+
+
 class ChatClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._stream_usage = True  # ask OpenAI-compatible servers for exact token usage
+        self._merge_system = False  # some chat templates (e.g. older Gemma/Mistral) reject a system role
 
     # ------------------------------------------------------------------ public
     def chat(
@@ -65,16 +88,49 @@ class ChatClient:
         temperature = self.cfg.temperature if temperature is None else temperature
         max_tokens = max_tokens or self.cfg.max_output_tokens
         last_err: Optional[Exception] = None
-        for attempt in range(3):
+
+        def tap(piece: str) -> None:
+            STATS.token(piece)
+            if on_token:
+                on_token(piece)
+
+        if self._merge_system:
+            messages = _merge_system_messages(messages)
+        for attempt in range(4):
+            STATS.begin(messages)
             try:
                 if self.cfg.provider == "ollama":
-                    return self._chat_ollama(messages, temperature, max_tokens, on_token)
-                return self._chat_openai(messages, temperature, max_tokens, on_token)
+                    res = self._chat_ollama(messages, temperature, max_tokens, tap)
+                else:
+                    res = self._chat_openai(messages, temperature, max_tokens, tap)
+                STATS.finish(res.usage)
+                return res
+            except urllib.error.HTTPError as e:
+                STATS.abort()
+                detail = _peek(e)
+                if e.code in (400, 422, 500) and not self._merge_system and re.search(
+                        r"system|role|conversation roles|alternate", detail, re.I):
+                    self._merge_system = True  # template has no system role: fold it into the user turn
+                    messages = _merge_system_messages(messages)
+                    last_err = e
+                    continue
+                if e.code in (400, 422) and self._stream_usage:
+                    self._stream_usage = False  # server rejected stream_options; retry without it
+                    last_err = e
+                    continue
+                last_err = e
+                if e.code < 500:
+                    break
+                time.sleep(2 * (attempt + 1))
             except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+                STATS.abort()
                 last_err = e
                 if isinstance(e, urllib.error.HTTPError) and e.code < 500:
                     break
                 time.sleep(2 * (attempt + 1))
+            except BaseException:
+                STATS.abort()
+                raise
         raise ModelError(self._explain(last_err))
 
     def list_models(self) -> List[str]:
@@ -119,9 +175,20 @@ class ChatClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if self._stream_usage:
+            body["stream_options"] = {"include_usage": True}
         parts: List[str] = []
         finish = "stop"
+        usage = None
         with self._post_stream(url, body) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            if "json" in ctype and "stream" not in ctype:  # server ignored stream=true
+                data = json.loads(resp.read().decode("utf-8"))
+                choice = (data.get("choices") or [{}])[0]
+                text = (choice.get("message") or {}).get("content") or choice.get("text") or ""
+                if text and on_token:
+                    on_token(text)
+                return ChatResult(text, choice.get("finish_reason") or "stop", data.get("usage"))
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
@@ -135,7 +202,9 @@ class ChatClient:
                     continue
                 if chunk.get("error"):
                     raise ModelError(str(chunk["error"]))
-                for choice in chunk.get("choices", []):
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or choice.get("message") or {}
                     piece = delta.get("content") or ""
                     if piece:
@@ -144,7 +213,7 @@ class ChatClient:
                             on_token(piece)
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
-        return ChatResult("".join(parts), finish)
+        return ChatResult("".join(parts), finish, usage)
 
     def _chat_ollama(self, messages, temperature, max_tokens, on_token) -> ChatResult:
         url = self._ollama_base() + "/api/chat"
@@ -160,6 +229,7 @@ class ChatClient:
         }
         parts: List[str] = []
         finish = "stop"
+        usage = None
         with self._post_stream(url, body) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -178,8 +248,14 @@ class ChatClient:
                         on_token(piece)
                 if chunk.get("done"):
                     finish = chunk.get("done_reason") or "stop"
+                    if chunk.get("eval_count"):
+                        usage = {
+                            "prompt_tokens": chunk.get("prompt_eval_count") or 0,
+                            "completion_tokens": chunk["eval_count"],
+                            "gen_seconds": (chunk.get("eval_duration") or 0) / 1e9,
+                        }
                     break
-        return ChatResult("".join(parts), finish)
+        return ChatResult("".join(parts), finish, usage)
 
     def _explain(self, err: Optional[Exception]) -> str:
         where = self._ollama_base() if self.cfg.provider == "ollama" else self.cfg.base_url

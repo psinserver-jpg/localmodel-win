@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -12,7 +13,7 @@ from . import __version__, ui
 from .checks import format_findings, has_errors, run_checks
 from .client import ChatClient, ModelError
 from .config import Config, load_config
-from .exporter import build_prompt
+from .exporter import build_commands, build_prompt
 from .pipeline import Pipeline, read_request
 from .skills import load_skills, select_skills
 from .workspace import Workspace
@@ -21,7 +22,7 @@ from .workspace import Workspace
 def _add_model_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("model server")
     g.add_argument("--config", help="path to lmw.config.json")
-    g.add_argument("--provider", choices=["openai", "ollama"], help="openai = any OpenAI-compatible server; ollama = native Ollama API (sets num_ctx)")
+    g.add_argument("--provider", help="ollama | openai | lmstudio | vllm | llamacpp | sglang | ... (see: lmw servers)")
     g.add_argument("--base-url", dest="base_url", help="e.g. http://localhost:11434/v1 (Ollama), http://localhost:1234/v1 (LM Studio), http://localhost:8080/v1 (llama.cpp)")
     g.add_argument("-m", "--model", help="model name, e.g. qwen2.5-coder:14b")
     g.add_argument("--api-key", dest="api_key")
@@ -50,12 +51,15 @@ OVERRIDE_KEYS = ["provider", "base_url", "model", "api_key", "context_tokens", "
 
 def _cfg(args: argparse.Namespace) -> Config:
     overrides: Dict = {k: getattr(args, k, None) for k in OVERRIDE_KEYS}
-    return load_config(getattr(args, "config", None), overrides)
+    cfg = load_config(getattr(args, "config", None), overrides)
+    from .stats import configure
+    configure(cfg.statusline)
+    return cfg
 
 
 def _ask(question: str) -> str:
     try:
-        return input("  ? %s\n    > " % question)
+        return ui.read_line("  ? %s\n    > " % question)
     except EOFError:
         return ""
 
@@ -120,6 +124,74 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_commands(args) -> int:
+    cfg = _cfg(args)
+    for f in build_commands(cfg, args.output):
+        ui.ok("wrote " + f)
+    ui.info("Open WebUI: Workspace > Prompts > Import > openwebui-prompts.json, then type /lmw in chat")
+    return 0
+
+
+def cmd_shell(args) -> int:
+    from .repl import run_shell
+    from .setup import needs_setup, run_wizard
+    cfg = _cfg(args)
+    if needs_setup() and not args.model and not args.base_url:
+        run_wizard(cfg)
+    return run_shell(cfg, Path(args.workspace), args.auth)
+
+
+def cmd_login(args) -> int:
+    from .remote_control import login
+    return 0 if login(args.hub or "") else 1
+
+
+def cmd_logout(args) -> int:
+    from .remote_control import logout
+    logout()
+    return 0
+
+
+def cmd_watch(args) -> int:
+    from .remote_control import watch
+    return watch(args.auth)
+
+
+def cmd_ssh(args) -> int:
+    from .remote import cmd_ssh as run
+    extra = list(args.lmw_args or [])
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    return run(args.host, args.port, args.dir, args.windows, extra)
+
+
+def cmd_ssh_install(args) -> int:
+    from .remote import REPO_URL, cmd_install
+    return cmd_install(args.host, args.port, args.windows, args.branch, args.repo or REPO_URL)
+
+
+def cmd_tunnel(args) -> int:
+    from .remote import cmd_tunnel as run
+    return run(args.host, args.port, args.local_port, args.remote_port)
+
+
+def cmd_servers(args) -> int:
+    from .servers import SERVERS, detect
+    ui.info("감지 중…")
+    alive = {x.probe for x in detect()}
+    for x in SERVERS:
+        mark = ui.green("✔ 실행 중") if x.probe in alive else ui.dim("—")
+        print("  %-11s %-26s %-34s %s" % (x.key, x.label, x.base_url, mark))
+    print(ui.dim("\n  사용: lmw --provider <이름>  (예: --provider lmstudio)  · 어떤 모델이든 동일하게 지원"))
+    return 0
+
+
+def cmd_setup(args) -> int:
+    from .setup import run_wizard
+    cfg = _cfg(args)
+    return 0 if run_wizard(cfg) else 1
+
+
 def cmd_check(args) -> int:
     cfg = _cfg(args)
     ws = Workspace(Path(args.workspace))
@@ -178,6 +250,9 @@ def cmd_init(args) -> int:
     return 0
 
 
+NO_LOGIN = {"login", "logout"}  # everything else requires a logged-in account
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lmw", description="LMW — keep local models on task: think, plan, build, review, fix, deliver.")
     p.add_argument("--version", action="version", version="lmw " + __version__)
@@ -211,12 +286,62 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--config")
     e.set_defaults(func=cmd_export)
 
+    sh = sub.add_parser("chat", help="interactive agent shell (default when no command is given)")
+    _add_model_args(sh)
+    _add_workflow_args(sh)
+    sh.set_defaults(func=cmd_shell)
+
+    ss = sub.add_parser("ssh", help="open lmw on another computer over SSH (lmw must be installed there)")
+    ss.add_argument("host", help="user@host or an alias from ~/.ssh/config")
+    ss.add_argument("-p", "--port", type=int, default=0, help="SSH port")
+    ss.add_argument("-d", "--dir", default="", help="remote project folder to work in")
+    ss.add_argument("--windows", action="store_true", help="the remote computer runs Windows")
+    ss.add_argument("lmw_args", nargs=argparse.REMAINDER, help="arguments for the remote lmw (default: interactive shell)")
+    ss.set_defaults(func=cmd_ssh)
+
+    si = sub.add_parser("ssh-install", help="install or update lmw on a remote computer over SSH")
+    si.add_argument("host")
+    si.add_argument("-p", "--port", type=int, default=0)
+    si.add_argument("--windows", action="store_true", help="the remote computer runs Windows")
+    si.add_argument("--branch", default="main", help="git branch to install (default: main)")
+    si.add_argument("--repo", help="git URL (default: this project's GitHub repo)")
+    si.set_defaults(func=cmd_ssh_install)
+
+    tn = sub.add_parser("tunnel", help="use a remote computer's model server from this PC (SSH port forward)")
+    tn.add_argument("host")
+    tn.add_argument("-p", "--port", type=int, default=0)
+    tn.add_argument("--local-port", type=int, default=11434)
+    tn.add_argument("--remote-port", type=int, default=11434, help="11434 Ollama, 1234 LM Studio, 8080 llama.cpp")
+    tn.set_defaults(func=cmd_tunnel)
+
+    lg = sub.add_parser("login", help="log in to your LMW Hub account (opens the site)")
+    lg.add_argument("--hub", help="hub URL (default: LMW_HUB or the built-in hub)")
+    lg.set_defaults(func=cmd_login)
+
+    lo = sub.add_parser("logout", help="log out this computer")
+    lo.set_defaults(func=cmd_logout)
+
+    wt = sub.add_parser("watch", help="show the live lmw screen of another computer on your account")
+    wt.set_defaults(func=cmd_watch)
+
+    cm = sub.add_parser("commands", help="build /lmw slash commands (Open WebUI import + agent CLI commands)")
+    cm.add_argument("-o", "--output", default="dist")
+    cm.add_argument("--config")
+    cm.set_defaults(func=cmd_commands)
+
     c = sub.add_parser("check", help="run the automated checks on a folder")
     c.add_argument("files", nargs="*", help="files to check (default: all)")
     c.add_argument("-w", "--workspace", default=".")
     c.add_argument("--check", dest="checks", action="append")
     c.add_argument("--config")
     c.set_defaults(func=cmd_check)
+
+    sv = sub.add_parser("servers", help="list supported model servers and which are running")
+    sv.set_defaults(func=cmd_servers)
+
+    su = sub.add_parser("setup", help="interactive setup: pick server, model and context size")
+    su.add_argument("--config")
+    su.set_defaults(func=cmd_setup)
 
     d = sub.add_parser("doctor", help="test the connection to your model server")
     _add_model_args(d)
@@ -232,11 +357,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     ui.setup_console()
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
+        argv = ["chat"] + argv  # `lmw` / `lmw -m qwen3` opens the interactive shell
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
     try:
+        args.auth = None
+        if args.command not in NO_LOGIN:
+            from .remote_control import require_login
+            args.auth = require_login()
+            if not args.auth:
+                ui.err("lmw 는 로그인 후 사용할 수 있습니다:  lmw login")
+                return 1
         return args.func(args)
     except KeyboardInterrupt:
         ui.err("interrupted — continue later with: lmw resume")

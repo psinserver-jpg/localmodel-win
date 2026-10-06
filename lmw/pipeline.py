@@ -59,12 +59,15 @@ class Pipeline:
         run_id: Optional[str] = None,
         client: Optional[ChatClient] = None,
         ask: Optional[AskFn] = None,
+        approve: Optional[Callable[[list], list]] = None,
+        session_context: str = "",
     ):
         self.cfg = cfg
         self.client = client or ChatClient(cfg)
         self.templates = Templates(cfg.resolved_prompts_dir())
         self.all_skills = load_skills(cfg.resolved_skills_dir())
         self.ask = ask
+        self.approve = approve  # callback(blocks) -> blocks the user accepted
 
         root = workspace_dir.resolve()
         lmw_dir = root / ".lmw" / "runs"
@@ -104,9 +107,12 @@ class Pipeline:
                 "touched": [],
                 "status": "running",
                 "calls": 0,
+                "session_context": session_context,
+                "created": [],
             }
         self.ws = Workspace(root, backup_dir=self.run_dir / "backup")
         self.ws.touched = list(self.state.get("touched", []))
+        self.ws.created = list(self.state.get("created", []))
         self.lang_rule = language_rule(self.state["request"])
         self.skills = self._pick_skills(self.state["request"])
 
@@ -117,6 +123,7 @@ class Pipeline:
 
     def save(self) -> None:
         self.state["touched"] = self.ws.touched
+        self.state["created"] = self.ws.created
         (self.run_dir / "state.json").write_text(
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -203,6 +210,15 @@ class Pipeline:
         self.save()
         return text
 
+    def _apply(self, blocks):
+        if self.approve and blocks:
+            accepted = self.approve(blocks)
+            rejected = [b.path for b in blocks if b not in accepted]
+            changed, problems = self.ws.apply_blocks(accepted)
+            problems += ["The user REJECTED the change to %s. Do not change it the same way again." % r for r in rejected]
+            return changed, problems
+        return self.ws.apply_blocks(blocks)
+
     def _files_for_review(self) -> List[str]:
         files = list(self.ws.touched)
         for f in plan_files(self.state.get("plan", "")):
@@ -251,8 +267,13 @@ class Pipeline:
         self._goto("review_analysis")
 
     def _clarifications_block(self) -> str:
-        c = self.state.get("clarifications")
-        return "## User clarifications\n" + c if c else ""
+        parts = []
+        if self.state.get("session_context"):
+            parts.append("## Earlier in this session (already done; those files exist in the workspace)\n"
+                         + self.state["session_context"])
+        if self.state.get("clarifications"):
+            parts.append("## User clarifications\n" + self.state["clarifications"])
+        return "\n\n".join(parts)
 
     # --- 2. REVIEW UNDERSTANDING ---------------------------------------------
     def stage_review_analysis(self) -> None:
@@ -369,7 +390,7 @@ class Pipeline:
                                 "=== FILE: path === blocks. Output the files now in exactly that format.",
                                 expect_files=True)
                 parsed = parse_file_blocks(out)
-            changed, problems = self.ws.apply_blocks(parsed.blocks)
+            changed, problems = self._apply(parsed.blocks)
             for c in changed:
                 ui.ok("wrote " + c)
             for p in problems:
@@ -468,7 +489,7 @@ class Pipeline:
         }, self.cfg.input_budget())
         out = self.call("fix", prompt, expect_files=True)
         parsed = parse_file_blocks(out)
-        changed, problems = self.ws.apply_blocks(parsed.blocks)
+        changed, problems = self._apply(parsed.blocks)
         for c in changed:
             ui.ok("updated " + c)
         for p in problems:
@@ -501,6 +522,7 @@ class Pipeline:
         print()
         ui.info("report: %s" % (self.run_dir / "REPORT.md"))
         ui.info("logs of every phase: %s" % self.run_dir)
+        ui.status("  📊 ")
         if self.ws.backup_dir and self.ws.backup_dir.exists():
             ui.info("originals of overwritten files: %s" % self.ws.backup_dir)
         self._goto("done")

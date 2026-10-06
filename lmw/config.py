@@ -46,6 +46,13 @@ class Config:
 
     # Output
     verbose: bool = False  # stream model text to the console
+    # remote control (relay runs on this computer when remote control turns on)
+    remote_port: int = 8787
+    remote_bind: str = "0.0.0.0"  # "127.0.0.1" = this computer only (use with a tunnel)
+    remote_tunnel: str = "none"  # none | tailscale | cloudflared | ssh
+    remote_tunnel_target: str = ""  # for ssh: user@server[:port]
+    # live status line fields: clock, session, tokens, speed, ttft, duration, calls
+    statusline: List[str] = field(default_factory=lambda: ["clock", "session", "tokens", "speed", "ttft", "duration"])
 
     def resolved_skills_dir(self) -> Path:
         return _resolve_dir(self.skills_dir, "skills")
@@ -113,13 +120,19 @@ def _coerce(name: str, value: Any) -> Any:
     return value
 
 
+def global_config_file() -> Path:
+    return Path(os.environ.get("LMW_HOME") or (Path.home() / ".lmw")) / "config.json"
+
+
 def find_config_file(start: Optional[Path] = None) -> Optional[Path]:
+    """Project config (lmw.config.json in the folder) wins over the global ~/.lmw/config.json."""
     for base in [start or Path.cwd(), REPO_DIR]:
         for name in CONFIG_FILENAMES:
             p = base / name
             if p.is_file():
                 return p
-    return None
+    g = global_config_file()
+    return g if g.is_file() else None
 
 
 def load_config(path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Config:
@@ -144,7 +157,13 @@ def load_config(path: Optional[str] = None, overrides: Optional[Dict[str, Any]] 
             setattr(cfg, key, _coerce(key, value))
 
     if cfg.provider not in ("openai", "ollama"):
-        raise ValueError("provider must be 'openai' or 'ollama', got %r" % cfg.provider)
+        from .servers import resolve
+        server = resolve(cfg.provider)  # e.g. "lmstudio", "vllm", "llamacpp"
+        if not server:
+            raise ValueError("unknown provider %r (use openai, ollama, or a server name: lmw servers)" % cfg.provider)
+        if cfg.base_url == Config().base_url:
+            cfg.base_url = server.base_url
+        cfg.provider = server.provider
     if cfg.max_output_tokens >= cfg.context_tokens:
         raise ValueError("max_output_tokens must be smaller than context_tokens")
     return cfg

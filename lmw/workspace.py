@@ -27,6 +27,7 @@ class Workspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.backup_dir = backup_dir
         self.touched: List[str] = []  # files written during this run, in order
+        self.created: List[str] = []  # files that did not exist before this run
 
     # ----------------------------------------------------------------- paths
     def resolve(self, rel: str) -> Path:
@@ -104,6 +105,8 @@ class Workspace:
 
     def write(self, rel: str, content: str) -> None:
         p = self.resolve(rel)
+        if not p.exists() and rel not in self.created:
+            self.created.append(rel)
         self._backup(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         # newline="" keeps "\n" as-is on Windows; editors handle LF fine.

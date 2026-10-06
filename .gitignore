@@ -4,3 +4,4 @@ __pycache__/
 lmw.config.json
 .venv/
 *.egg-info/
+_private/
