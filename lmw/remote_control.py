@@ -27,9 +27,16 @@ from . import ui
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
+def _user_agent() -> str:
+    import platform
+    from . import __version__
+    # A real User-Agent: Cloudflare and similar proxies block the default "Python-urllib/x.y".
+    return "lmw-cli/%s (%s %s; Python %s)" % (__version__, platform.system(), platform.release(), platform.python_version())
+
+
 def _req(method: str, url: str, body: Optional[dict] = None, token: str = "", timeout: float = 30):
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _user_agent()}
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -93,9 +100,12 @@ def login(hub: str = "", open_browser: bool = True) -> Optional[Dict[str, str]]:
         return None
     try:
         _, start = _req("POST", hub + "/api/device/start", {"device": _device_name()})
+    except urllib.error.HTTPError as e:
+        _explain_http(hub, e)
+        return None
     except (urllib.error.URLError, OSError) as e:
         ui.err("Hub 에 연결할 수 없습니다: %s (%s)" % (hub, e))
-        ui.info("Hub 주소가 맞는지, 이 PC가 그 주소에 접속 가능한지 확인하세요 (Tailscale 주소라면 Tailscale 연결 필요)")
+        ui.info("인터넷 연결과 Hub 주소를 확인하세요")
         return None
     url = "%s/device?code=%s" % (hub, start["code"])
     print()
@@ -128,6 +138,23 @@ def login(hub: str = "", open_browser: bool = True) -> Optional[Dict[str, str]]:
         return None
     ui.err("시간이 초과되었습니다. 다시 실행하세요")
     return None
+
+
+def _explain_http(hub: str, e: urllib.error.HTTPError) -> None:
+    try:
+        body = e.read().decode("utf-8", errors="replace")[:2000]
+    except Exception:
+        body = ""
+    server = (e.headers.get("Server") or "") if e.headers else ""
+    ui.err("Hub 가 요청을 거부했습니다: %s (HTTP %s)" % (hub, e.code))
+    if "cloudflare" in server.lower() or "cloudflare" in body.lower():
+        ui.info("Cloudflare 가 차단했습니다 (봇 차단). 관리자: Cloudflare → 보안 → Bots 에서 Bot Fight Mode 끄기,")
+        ui.info("또는 DNS 에서 이 도메인의 주황색 구름을 회색(DNS only)으로 바꾸세요")
+    elif body.strip().startswith("{"):
+        try:
+            ui.info(json.loads(body).get("error", ""))
+        except ValueError:
+            pass
 
 
 def _password_login(hub: str) -> Optional[Dict[str, str]]:
