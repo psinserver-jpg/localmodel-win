@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import ui
-from .client import ChatClient, ModelError
+from .client import ChatClient, ContextRefit, ModelError
 from .config import Config
 from .events import TOOL_LABELS, emit
 from .parse import apply_edits, Edit
@@ -500,7 +500,7 @@ class Agent:
         picked = [s for s in select_skills(self._skills, user_text, self.cfg.skills, self.cfg.exclude_skills) if not s.always]
         skills = ""
         if picked and effort != "low":
-            budget = max(600, self.cfg.input_budget() // 6)
+            budget = max(600, self._budget() // 6)
             body = "\n\n".join("## %s\n%s" % (s.name, s.body) for s in picked)
             skills = "\n# Expert guidance\n" + truncate_to_tokens(body, budget)
         tools = TOOL_DOCS % ("cmd.exe" if os.name == "nt" else "sh")
@@ -517,14 +517,19 @@ class Agent:
     def _history_tokens(self) -> int:
         return sum(estimate_tokens(m["content"]) for m in self.history)
 
+    def _budget(self) -> int:
+        """Prompt budget: what the config allows AND what really fits on the server (learned token ratio)."""
+        pb = getattr(self.client, "prompt_budget", None)
+        return min(self.cfg.input_budget(), pb()) if callable(pb) else self.cfg.input_budget()
+
     def maybe_compact(self, system: str) -> None:
-        budget = self.cfg.input_budget() - estimate_tokens(system)
+        budget = self._budget() - estimate_tokens(system)
         if self._history_tokens() > self.COMPACT_AT * budget and len(self.history) > 4:
             self.compact(budget)
 
     def compact(self, budget: Optional[int] = None, manual: bool = False) -> bool:
         """Replace older messages with a model-written summary, keep the recent ones word for word."""
-        budget = budget or self.cfg.input_budget()
+        budget = budget or self._budget()
         before = self._history_tokens()
         # keep the newest messages (about a third of the budget), starting at a real user message
         keep, used = len(self.history), 0
@@ -573,7 +578,7 @@ class Agent:
 
     def _fit(self, system: str) -> List[Dict[str, str]]:
         """System + as much recent history as fits; old tool results are shortened first."""
-        budget = self.cfg.input_budget() - estimate_tokens(system)
+        budget = self._budget() - estimate_tokens(system)
         msgs = [dict(m) for m in self.history]
         total = sum(estimate_tokens(m["content"]) for m in msgs)
         i = 0
@@ -591,7 +596,7 @@ class Agent:
         return [{"role": "system", "content": system}] + msgs
 
     def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None],
-              think: Optional[bool] = None, show_thinking: bool = True) -> Tuple[str, str]:
+              think: Optional[bool] = None, show_thinking: bool = True, refit: bool = False) -> Tuple[str, str]:
         progress = ui.Progress(self.cfg.verbose, show_status=False)  # stats are shown once per turn
         self._n = getattr(self, "_n", 0) + 1
         live = {"id": "th%d_%d" % (int(time.time()), self._n), "buf": "", "on": False, "done": not show_thinking,
@@ -624,7 +629,7 @@ class Agent:
                 emit("thinking_live", id=live["id"], text=b.replace("<think>", "").strip())
 
         try:
-            res = self.client.chat(messages, on_token=tap, think=think)
+            res = self.client.chat(messages, on_token=tap, think=think, **({"refit": True} if refit else {}))
         finally:
             progress.done()
         return res.text, res.finish_reason
@@ -651,7 +656,14 @@ class Agent:
             system = self._system(text, effort, readonly)
             self.maybe_compact(system)  # summarize old messages before the context overflows
             t0 = time.time()
-            raw, finish = self._call(self._fit(system), lambda s: None, think=think)
+            try:
+                raw, finish = self._call(self._fit(system), lambda s: None, think=think, refit=True)
+            except ContextRefit:  # the model process crashed: smaller prompt, then try this step again
+                emit("notice", level="warn", text="모델 서버가 멈춰서 프롬프트를 줄여 다시 시도합니다 (컨텍스트 %dK)"
+                     % (self.client._num_ctx() // 1024))
+                system = self._system(text, effort, readonly)
+                self.compact(self._budget() - estimate_tokens(system)) if len(self.history) > 4 else None
+                raw, finish = self._call(self._fit(system), lambda s: None, think=think, refit=True)
             thinking, visible = split_thinking(raw)
             if thinking and not self.last_think:  # (already shown live when the answer started)
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))

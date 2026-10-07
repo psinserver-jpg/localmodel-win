@@ -28,6 +28,10 @@ class ModelError(RuntimeError):
     pass
 
 
+class ContextRefit(Exception):
+    """The model process crashed: the caller should rebuild a smaller prompt and try again."""
+
+
 class _RunnerCrash(Exception):
     """Ollama's model process stopped (often: out of GPU memory)."""
 
@@ -118,8 +122,10 @@ class ChatClient:
         max_tokens: Optional[int] = None,
         on_token: TokenCallback = None,
         think: Optional[bool] = None,
+        refit: bool = False,
     ) -> ChatResult:
-        """think=False asks reasoning models (Qwen3, DeepSeek-R1, …) to answer without thinking."""
+        """think=False asks reasoning models (Qwen3, DeepSeek-R1, …) to answer without thinking.
+        refit=True: on a model-process crash raise ContextRefit, so the caller rebuilds a smaller prompt."""
         self._think = think
         temperature = self.cfg.temperature if temperature is None else temperature
         max_tokens = max_tokens or self.cfg.max_output_tokens
@@ -134,12 +140,16 @@ class ChatClient:
             messages = _merge_system_messages(messages)
         for attempt in range(4):
             STATS.begin(messages)
+            est = STATS.current.prompt_tokens if STATS.current else 0
             try:
-                if self.cfg.provider == "ollama":
+                if self.cfg.provider == "ollama" and not getattr(self, "_compat", False):
                     res = self._chat_ollama(messages, temperature, max_tokens, tap)
                 else:
                     res = self._chat_openai(messages, temperature, max_tokens, tap)
                 STATS.finish(res.usage)
+                real = int((res.usage or {}).get("prompt_tokens") or 0)
+                if real and est > 200:  # learn how our token estimate compares with the server's count
+                    self.token_ratio = max(1.0, min(3.0, 0.5 * self.token_ratio + 0.5 * real / est))
                 return res
             except urllib.error.HTTPError as e:
                 STATS.abort()
@@ -154,6 +164,10 @@ class ChatClient:
                     self._think_kw = False  # server rejected the no-thinking switch; retry without it
                     last_err = e
                     continue
+                if e.code == 500 and self.is_ollama() and self._runner_crashed(detail) and refit and attempt < 2:
+                    self._last_detail = detail
+                    self._shrink()
+                    raise ContextRefit(detail)
                 if e.code == 500 and self.is_ollama() and self._runner_crashed(detail) and self._num_ctx() > 8192:
                     self._ctx_cap = max(8192, self._num_ctx() // 2)  # less GPU memory for the KV cache
                     self._last_detail = detail
@@ -177,6 +191,10 @@ class ChatClient:
             except _RunnerCrash as e:  # the model process died mid-answer
                 STATS.abort()
                 self._last_detail = str(e)
+                if refit and getattr(self, "_refits", 0) < 2:
+                    self._refits = getattr(self, "_refits", 0) + 1
+                    self._shrink()
+                    raise ContextRefit(str(e))
                 if self._num_ctx() > 8192 and attempt < 3:
                     self._ctx_cap = max(8192, self._num_ctx() // 2)
                     try:
@@ -273,12 +291,33 @@ class ChatClient:
                     "  해결: GPU 를 쓰는 다른 프로그램을 끄거나, 더 작은 모델(/model) 또는 작은 컨텍스트(/ctx 16384)를 쓰세요."
                     % (gpu.describe(info) or str(detail).strip()[:200]))
         where = gpu.describe(info)
+        log = gpu.ollama_log_errors()
+        if log:  # Ollama's own log says why: show that instead of guesses
+            return ("Ollama 가 모델을 실행하다 멈췄습니다 (%s). Ollama 로그의 마지막 오류:\n%s\n"
+                    "  이 줄을 그대로 알려주시면 원인을 찾을 수 있습니다.%s"
+                    % (str(detail).strip()[:120] or "EOF", log, ("\n  현재 GPU — " + where) if where else ""))
         return (("현재 GPU — %s\n  " % where if where else "") + "Ollama 가 모델을 실행하다 멈췄습니다 (%s). 흔한 원인:\n"
                 "  · GPU 메모리 부족 — 다른 프로그램(vLLM, Open WebUI 의 다른 모델, 게임 등)이 GPU 를 쓰는지 nvidia-smi 로 확인\n"
                 "  · Ollama 가 오래됨 — RTX 50 시리즈는 최신 Ollama 필요 (ollama --version)\n"
                 "  · 컨텍스트가 큼 — /ctx 16384 로 줄여 보기\n"
                 "  같은 GPU 에서 vLLM 이 이미 모델을 띄우고 있다면 /server 로 그 vLLM 을 lmw 에 연결하면 됩니다."
                 % (str(detail).strip()[:200] or "EOF"))
+
+    token_ratio = 1.15  # real tokens per estimated token (paths, Korean, code count more); learned per server
+
+    def prompt_budget(self) -> int:
+        """Estimated-token budget for a prompt, so the REAL prompt fits in the context sent to the server."""
+        ctx = self._num_ctx()
+        room = ctx - min(self.cfg.max_output_tokens, ctx // 3) - max(256, ctx // 12)
+        return max(1024, int(room / self.token_ratio))
+
+    def _shrink(self) -> None:
+        """After a crash: a smaller context, and expect more tokens per estimate."""
+        self.token_ratio = min(3.0, self.token_ratio * 1.3)
+        if self.cfg.provider == "ollama" and not getattr(self, "_compat", False):
+            self._compat = True  # next try: Ollama's OpenAI-compatible endpoint (a different code path in Ollama)
+        if self._num_ctx() > 8192:
+            self._ctx_cap = max(8192, self._num_ctx() * 3 // 4)
 
     def _num_ctx(self) -> int:
         return min(self.cfg.context_tokens, getattr(self, "_ctx_cap", 0) or self.cfg.context_tokens)
@@ -324,7 +363,8 @@ class ChatClient:
         return urllib.request.urlopen(req, timeout=self.cfg.timeout)
 
     def _chat_openai(self, messages, temperature, max_tokens, on_token) -> ChatResult:
-        url = self.cfg.base_url.rstrip("/") + "/chat/completions"
+        base = self._ollama_base() + "/v1" if self.cfg.provider == "ollama" else self.cfg.base_url.rstrip("/")
+        url = base + "/chat/completions"
         body = {
             "model": self.cfg.model,
             "messages": messages,
