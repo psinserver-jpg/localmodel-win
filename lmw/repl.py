@@ -41,6 +41,8 @@ COMMANDS = [
     ("/plan", "계획 단계로 진행: 분석 → 계획 → 구현 → 검토·수정 반복 (/계획, /plan 요청)", "작업"),
     ("/ask", "질문하기 (읽기만, 변경 없음)", "작업"),
     ("/new", "새 세션 시작", "작업"),
+    ("/sessions", "지난 세션 목록에서 골라 이어서 하기", "작업"),
+    ("/continue", "가장 최근 세션 이어서 하기", "작업"),
     ("/mode", "권한 모드: 매번 묻기 / 편집 자동 수락 / 전체 허용", "설정"),
     ("/effort", "생각 수준: 자동 / 빠르게 / 보통 / 깊게", "설정"),
     ("/engine", "에이전트 엔진: lmw / aider", "설정"),
@@ -196,6 +198,11 @@ class Shell:
         from . import tui
         if not tui.available():
             print(ui.dim("  Enter = 메뉴 · / = 전체 명령 · Tab = 명령 자동완성 · 질문은 ? 로 끝내기"))
+        from . import sessions
+        prev = sessions.listing(str(self.root), 1)
+        if prev:
+            ui.info(ui.dim("지난 세션: '%s' (%s) — /continue 로 이어서 하기 · /sessions 로 고르기"
+                           % ((prev[0].get("title") or "새 세션")[:40], sessions.ago(prev[0].get("updated", 0)))))
         try:
             return self._loop()
         finally:
@@ -304,6 +311,9 @@ class Shell:
                 continue
             if line.startswith(CTL_PREFIX):
                 if line[len(CTL_PREFIX):] == "new_session":
+                    self.new_session()
+                elif line[len(CTL_PREFIX):] == "close_session":  # closed on the website: start a fresh one
+                    ui.info(ui.dim("웹에서 이 세션을 닫았습니다 — 새 세션으로 시작합니다 (/continue 로 다시 이어서 할 수 있음)"))
                     self.new_session()
                 continue
             if line.startswith(PERM_PREFIX):
@@ -430,6 +440,10 @@ class Shell:
                     self._remote_control("effort", list(EFFORT_LABELS)[i])
         elif cmd in ("/new", "/clear"):
             self.new_session()
+        elif cmd == "/sessions":
+            self.pick_saved_session()
+        elif cmd == "/continue":
+            self.pick_saved_session(latest=True)
         elif cmd in ("/plan", "/계획", "/deep"):
             if arg in ("off", "취소"):
                 self.plan_next = False
@@ -575,6 +589,8 @@ class Shell:
             self.plan_next = False
             route_override = "deep"
         kind = route_override or route(text, self.effort)
+        if not self.titled:
+            self._title = text.strip().replace("\n", " ")[:60]
         if self.bridge and not self.titled:
             self.bridge.set_meta(sid=self.sid, title=text.strip().replace("\n", " ")[:60])
             self.titled = kind != "chat"  # small talk is only a placeholder title
@@ -609,6 +625,10 @@ class Shell:
             emit("error", text="%s: %s" % (type(e).__name__, e))
         finally:
             self.usage.end_turn()
+            try:
+                self.save_session()  # closed sessions can be continued later (/sessions, website)
+            except Exception:
+                pass
             if self.bridge:
                 self.bridge.channel(self.sid).running = False
             emit("turn_end", stats=turn_stats(t0, tin, tout, self.usage), session=self.usage.line())
@@ -758,6 +778,63 @@ class Shell:
                 self.bridge.set_meta(sid=self.sid, effort=value)
             emit("notice", level="info", text="생각 수준: %s" % EFFORT_LABELS[value])
 
+    # ------------------------------------------------ saved conversations
+    def session_key(self) -> str:
+        if self.sid:
+            return self.sid
+        if self.bridge:
+            return self.bridge.session_id
+        if not getattr(self, "_local_key", None):
+            self._local_key = "local-%d" % int(time.time() * 1000)
+        return self._local_key
+
+    def save_session(self) -> None:
+        from . import sessions
+        history = self.agent.history if self.agent else []
+        if not history and not self.chat:
+            return
+        sessions.save(self.session_key(), {
+            "title": getattr(self, "_title", "") or "새 세션", "cwd": str(self.root), "model": self.cfg.model,
+            "created": self.usage.started, "history": history, "chat": self.chat[-40:],
+            "done_tasks": self.done_tasks[-20:],
+            "usage": {"prompt_tokens": self.usage.prompt_tokens, "output_tokens": self.usage.output_tokens,
+                      "calls": self.usage.calls, "work_seconds": self.usage.work_seconds},
+        })
+
+    def restore_session(self, data: Dict) -> None:
+        """Continue a saved conversation in this session (the model sees the earlier messages)."""
+        from .events import emit
+        agent = self._get_agent()
+        agent.history = list(data.get("history") or [])
+        self.chat = list(data.get("chat") or [])
+        self.done_tasks = list(data.get("done_tasks") or [])
+        self._title = data.get("title") or ""
+        self.titled = True
+        if self.bridge and self._title:
+            self.bridge.set_meta(sid=self.sid, title="↻ " + self._title[:58])
+        n = len(agent.history) + len(self.chat)
+        where = "" if os.path.normcase(str(data.get("cwd", ""))) == os.path.normcase(str(self.root)) else \
+            " (원래 폴더: %s)" % data.get("cwd", "")
+        emit("notice", level="info", text="이전 세션 '%s' 을(를) 이어서 합니다 — 메시지 %d개%s" % (self._title, n, where))
+        last = [m for m in agent.history if m.get("role") == "user" and not str(m.get("content", "")).startswith("<tool_result")]
+        if last:
+            emit("notice", level="info", text="마지막 요청: " + str(last[-1]["content"])[:200])
+
+    def pick_saved_session(self, latest: bool = False) -> None:
+        from . import sessions
+        cur = self.session_key()
+        items = [d for d in sessions.listing(str(self.root)) if d.get("key") != cur]
+        if not items:
+            ui.info("이 폴더에서 이어서 할 지난 세션이 없습니다")
+            return
+        if latest:
+            self.restore_session(items[0])
+            return
+        i = ui.menu("이어서 할 세션", [((d.get("title") or "새 세션")[:40],
+                                        "%s · %s" % (sessions.ago(d.get("updated", 0)), d.get("model", ""))) for d in items[:15]], 0)
+        if i >= 0:
+            self.restore_session(items[i])
+
     def new_session(self) -> None:
         from .events import emit
         self.agent = None
@@ -765,6 +842,8 @@ class Shell:
         self.done_tasks.clear()
         self.titled = False
         self.usage.reset()  # a new session starts counting from zero
+        self._title = ""
+        self._local_key = None
         if self.bridge:
             try:
                 self.bridge.new_session()
@@ -773,7 +852,7 @@ class Shell:
         emit("notice", level="info", text="새 세션을 시작했습니다")
 
     # ------------------------------------------------- sessions opened from the web
-    def open_web_session(self) -> None:
+    def open_web_session(self, resume: str = "") -> None:
         """'새 세션' on the website: host one more session in THIS process (like Claude Code)."""
         from .remote_control import Bridge
         if not self.bridge:
@@ -799,13 +878,44 @@ class Shell:
         self.workers.append(w)
         with ui.remote_muted():
             print(ui.dim("\n⇢ [웹 세션] 웹에서 새 세션이 열렸습니다 (이 터미널은 그대로 사용하세요)"))
+        if resume:
+            from . import sessions
+            data = sessions.load(resume)
+            if data:
+                from .events import set_context
+                set_context(ch.sid, background=True)
+                w.restore_session(data)
+                set_context("", False)
+            else:
+                from .events import emit, set_context
+                set_context(ch.sid, background=True)
+                emit("notice", level="warn", text="이 컴퓨터에 저장된 이전 대화를 찾지 못했습니다 — 새 세션으로 시작합니다")
+                set_context("", False)
         threading.Thread(target=w.serve_channel, args=(ch,), daemon=True).start()
+
+    def close_web_session(self, ch) -> None:
+        """'세션 닫기' on the website for a session hosted here: end it (its history stays)."""
+        from .events import emit
+        self.stop_event.set()
+        emit("notice", level="info", text="세션을 닫았습니다 — 기록은 남아 있고 '이어서 하기' 로 계속할 수 있습니다")
+        self.save_session()
+        if self.bridge:
+            self.bridge.flush(ended=True, only=ch)
+            ch.closed = True
+        main = getattr(self, "main_shell", None)
+        if main and self in main.workers:
+            main.workers.remove(self)
+        with ui.remote_muted():
+            print(ui.dim("⇢ [웹 세션] 웹에서 세션을 닫았습니다"))
 
     def serve_channel(self, ch) -> None:
         from .events import set_context
         set_context(ch.sid, background=True)
         while not ch.closed:
             text = self.pending.pop(0) if self.pending else self.read("")
+            if text == CTL_PREFIX + "close_session":
+                self.close_web_session(ch)
+                return
             if not text or text.startswith("\x00"):
                 continue  # late permission clicks / controls with nothing waiting
             try:

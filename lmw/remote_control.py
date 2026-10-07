@@ -571,8 +571,10 @@ class Bridge:
                     ch.on_control(action, value)
                 elif action == "permission":
                     ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
-                elif action == "new_session":
-                    threading.Thread(target=self.on_new_session, daemon=True).start()
+                elif action == "new_session":  # value = a closed session to continue (optional)
+                    threading.Thread(target=self.on_new_session, args=(str(value or ""),), daemon=True).start()
+                elif action == "close_session":
+                    ch.inbox.put(("web", CTL + "close_session"))
 
     def _save_upload(self, ch: Channel, msg: Dict) -> None:
         """A file sent from the website: save it as <project>/uploads/<name> (never overwrites)."""
