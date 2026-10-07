@@ -42,6 +42,7 @@ COMMANDS = [
     ("/ask", "질문하기 (읽기만, 변경 없음)", "작업"),
     ("/new", "새 세션 시작", "작업"),
     ("/sessions", "지난 세션 목록에서 골라 이어서 하기", "작업"),
+    ("/compact", "지금까지 대화를 요약해 컨텍스트 비우기 (가득 차면 자동으로 함)", "작업"),
     ("/continue", "가장 최근 세션 이어서 하기", "작업"),
     ("/mode", "권한 모드: 매번 묻기 / 편집 자동 수락 / 전체 허용", "설정"),
     ("/effort", "생각 수준: 자동 / 빠르게 / 보통 / 깊게", "설정"),
@@ -440,6 +441,9 @@ class Shell:
                     self._remote_control("effort", list(EFFORT_LABELS)[i])
         elif cmd in ("/new", "/clear"):
             self.new_session()
+        elif cmd == "/compact":
+            if not self.agent or not self.agent.compact(manual=True):
+                ui.info("요약할 대화가 아직 없습니다")
         elif cmd == "/sessions":
             self.pick_saved_session()
         elif cmd == "/continue":

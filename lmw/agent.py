@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import ui
-from .client import ChatClient
+from .client import ChatClient, ModelError
 from .config import Config
 from .events import TOOL_LABELS, emit
 from .parse import apply_edits, Edit
@@ -511,6 +511,66 @@ class Agent:
                              language=detect_language(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
                              tree=tree, skills=skills)
 
+    # ------------------------------------------------------- auto-compaction
+    COMPACT_AT = 0.8  # summarize older messages when the conversation fills 80% of the context
+
+    def _history_tokens(self) -> int:
+        return sum(estimate_tokens(m["content"]) for m in self.history)
+
+    def maybe_compact(self, system: str) -> None:
+        budget = self.cfg.input_budget() - estimate_tokens(system)
+        if self._history_tokens() > self.COMPACT_AT * budget and len(self.history) > 4:
+            self.compact(budget)
+
+    def compact(self, budget: Optional[int] = None, manual: bool = False) -> bool:
+        """Replace older messages with a model-written summary, keep the recent ones word for word."""
+        budget = budget or self.cfg.input_budget()
+        before = self._history_tokens()
+        # keep the newest messages (about a third of the budget), starting at a real user message
+        keep, used = len(self.history), 0
+        while keep > 0 and used + estimate_tokens(self.history[keep - 1]["content"]) < budget * 0.35:
+            keep -= 1
+            used += estimate_tokens(self.history[keep]["content"])
+        while keep < len(self.history) and not (self.history[keep]["role"] == "user"
+                                                and not self.history[keep]["content"].startswith("<tool_result")):
+            keep += 1
+        if keep >= len(self.history):  # the last request alone is huge: keep only the latest request
+            keep = max(i for i, m in enumerate(self.history) if m["role"] == "user")
+        head, tail = self.history[:keep], self.history[keep:]
+        if not head:
+            return False
+        lines, room = [], int(budget * 0.6) * 3  # characters of transcript the summarizer may read
+        for m in head:
+            c = str(m["content"])
+            if c.startswith("<tool_result"):
+                c = c[:600] + ("…" if len(c) > 600 else "")
+            else:
+                c = c[:3000] + ("…" if len(c) > 3000 else "")
+            lines.append("[%s] %s" % (m["role"], c))
+        transcript = "\n\n".join(lines)
+        if len(transcript) > room:  # keep the start (the goal) and the most recent part
+            transcript = transcript[: room // 3] + "\n\n[… middle omitted …]\n\n" + transcript[-(room * 2 // 3):]
+        lang = detect_language(next((m["content"] for m in head if m["role"] == "user"), ""))
+        msgs = [{"role": "system", "content": "You compress a coding-agent conversation so work can continue without it. "
+                 "Be faithful and specific; never invent anything."},
+                {"role": "user", "content": "Summarize this conversation in %s with these sections:\n"
+                 "## 목표 (the user's requests, exact requirements)\n## 한 일 (what was done, results of commands/tests)\n"
+                 "## 파일 (files created/changed and what is in them)\n## 결정·사실 (decisions, constraints, facts found, errors)\n"
+                 "## 남은 일 (what is still to do, next step)\n\nConversation:\n%s" % (lang, transcript)}]
+        try:
+            summary, _ = self._call(msgs, lambda s: None, think=False, show_thinking=False)
+            summary = split_thinking(summary)[1].strip()
+        except ModelError:
+            return False
+        if not summary:
+            return False
+        self.history = [{"role": "user", "content": "[Earlier part of this conversation, summarized to save context]\n" + summary},
+                        {"role": "assistant", "content": "Understood — I will continue from this summary."}] + tail
+        after = self._history_tokens()
+        emit("notice", level="info", text="%s이전 대화를 요약했습니다 — 컨텍스트 %s → %s 토큰 (최근 메시지 %d개는 그대로)"
+             % ("" if manual else "컨텍스트가 가득 차기 전에 자동으로 ", fmt_tokens(before), fmt_tokens(after), len(tail)))
+        return True
+
     def _fit(self, system: str) -> List[Dict[str, str]]:
         """System + as much recent history as fits; old tool results are shortened first."""
         budget = self.cfg.input_budget() - estimate_tokens(system)
@@ -589,6 +649,7 @@ class Agent:
         for step in range(MAX_STEPS):
             self.check_stop()
             system = self._system(text, effort, readonly)
+            self.maybe_compact(system)  # summarize old messages before the context overflows
             t0 = time.time()
             raw, finish = self._call(self._fit(system), lambda s: None, think=think)
             thinking, visible = split_thinking(raw)
