@@ -545,6 +545,8 @@ class Shell:
                 if n <= self.cfg.max_output_tokens:
                     raise ValueError
                 self.cfg.context_tokens = n
+                if hasattr(self.client, "forget_cap"):
+                    self.client.forget_cap()  # you chose a size: forget what crashes taught
                 ui.ok("context → %d tokens" % n)
             except ValueError:
                 ui.warn("사용법: /ctx 32768 (max_output_tokens=%d 보다 커야 함)" % self.cfg.max_output_tokens)

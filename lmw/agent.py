@@ -940,7 +940,16 @@ class Agent:
                      % (self.client._num_ctx() // 1024))
                 system = self._system(text, effort, readonly)
                 self.compact(self._budget() - estimate_tokens(system)) if len(self.history) > 4 else None
-                raw, finish = self._call(self._fit(system), lambda s: None, think=think, refit=True)
+                try:
+                    raw, finish = self._call(self._fit(system), lambda s: None, think=think, refit=True)
+                except ContextRefit:
+                    # still crashing: long reasoning fills the context/KV cache -> last try with thinking off
+                    if think is False:
+                        raise
+                    emit("notice", level="warn", text="추론이 길어져 메모리가 부족한 것 같습니다. 이번 단계는 추론 없이 다시 시도합니다.")
+                    think = False
+                    system = self._system(text, "low", readonly)
+                    raw, finish = self._call(self._fit(system), lambda s: None, think=False, refit=True)
             thinking, visible = split_thinking(raw)
             if thinking and not self.last_think:  # (already shown live when the answer started)
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))

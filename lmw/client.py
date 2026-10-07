@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from . import netutil
@@ -39,6 +41,9 @@ def _tool_call_text(tc: Dict) -> str:
         except ValueError:
             args = {"_raw": args}
     return "\n<tool_call>\n%s\n</tool_call>\n" % json.dumps({"name": f.get("name", ""), "arguments": args}, ensure_ascii=False)
+
+
+MIN_CTX = 4096  # the smallest context lmw will fall back to after crashes
 
 
 class ContextRefit(Exception):
@@ -126,6 +131,7 @@ class ChatClient:
         self._stream_usage = True  # ask OpenAI-compatible servers for exact token usage
         self._merge_system = False  # some chat templates (e.g. older Gemma/Mistral) reject a system role
         self._think: Optional[bool] = None  # per call: False = ask reasoning models not to think
+        self._ctx_cap = self._load_cap()  # a context size that crashed before is not tried again
 
     # ------------------------------------------------------------------ public
     def chat(
@@ -188,8 +194,8 @@ class ChatClient:
                     self._last_detail = detail
                     self._shrink()
                     raise ContextRefit(detail)
-                if e.code == 500 and self.is_ollama() and self._runner_crashed(detail) and self._num_ctx() > 8192:
-                    self._ctx_cap = max(8192, self._num_ctx() // 2)  # less GPU memory for the KV cache
+                if e.code == 500 and self.is_ollama() and self._runner_crashed(detail) and self._num_ctx() > MIN_CTX:
+                    self._set_cap(self._num_ctx() // 2)  # less GPU memory for the KV cache
                     self._last_detail = detail
                     try:
                         from .events import emit
@@ -215,8 +221,8 @@ class ChatClient:
                     self._refits = getattr(self, "_refits", 0) + 1
                     self._shrink()
                     raise ContextRefit(str(e))
-                if self._num_ctx() > 8192 and attempt < 3:
-                    self._ctx_cap = max(8192, self._num_ctx() // 2)
+                if self._num_ctx() > MIN_CTX and attempt < 3:
+                    self._set_cap(self._num_ctx() // 2)
                     try:
                         from .events import emit
                         emit("notice", level="warn", text="Ollama 가 답하는 중 멈춰서 컨텍스트를 %dK 로 줄여 다시 시도합니다"
@@ -331,13 +337,52 @@ class ChatClient:
         room = ctx - min(self.cfg.max_output_tokens, ctx // 3) - max(256, ctx // 12)
         return max(1024, int(room / self.token_ratio))
 
+    # ---- learned context cap (per model + server, kept in ~/.lmw/ctx-cap.json)
+    def _cap_key(self) -> str:
+        return "%s|%s" % (self.cfg.model, self.cfg.base_url if hasattr(self.cfg, "base_url") else "")
+
+    def _cap_file(self) -> Path:
+        return Path(os.environ.get("LMW_HOME") or (Path.home() / ".lmw")) / "ctx-cap.json"
+
+    def _load_cap(self) -> int:
+        try:
+            return int(json.loads(self._cap_file().read_text(encoding="utf-8")).get(self._cap_key(), 0))
+        except Exception:
+            return 0
+
+    def _set_cap(self, tokens: int) -> None:
+        self._ctx_cap = max(MIN_CTX, int(tokens) // 1024 * 1024)
+        try:
+            f = self._cap_file()
+            data = {}
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            data[self._cap_key()] = self._ctx_cap
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
+    def forget_cap(self) -> None:
+        """`/context` set by hand: drop what was learned from crashes."""
+        self._ctx_cap = 0
+        try:
+            f = self._cap_file()
+            data = json.loads(f.read_text(encoding="utf-8"))
+            data.pop(self._cap_key(), None)
+            f.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
     def _shrink(self) -> None:
         """After a crash: a smaller context, and expect more tokens per estimate."""
         self.token_ratio = min(3.0, self.token_ratio * 1.3)
         if self.cfg.provider == "ollama" and not getattr(self, "_compat", False):
             self._compat = True  # next try: Ollama's OpenAI-compatible endpoint (a different code path in Ollama)
-        if self._num_ctx() > 8192:
-            self._ctx_cap = max(8192, self._num_ctx() * 3 // 4)
+        if self._num_ctx() > MIN_CTX:
+            self._set_cap(self._num_ctx() * 3 // 4)
 
     def _num_ctx(self) -> int:
         return min(self.cfg.context_tokens, getattr(self, "_ctx_cap", 0) or self.cfg.context_tokens)
