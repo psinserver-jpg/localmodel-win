@@ -86,6 +86,20 @@ Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **작업 �
 `lmw` 가 켜져 있으면 [psin.ai.kr](https://psin.ai.kr) 에서 **＋ 새 세션** 을 눌러 같은 lmw 안에 세션을 더 열 수 있습니다 (터미널 세션은 그대로).
 [psin.ai.kr](https://psin.ai.kr) 에 같은 Google 계정으로 로그인하면 세션별 대화, 생각/작업 펼쳐보기, 권한 승인, 프롬프트 보내기를 폰에서도 할 수 있습니다.
 
+## 도구 · 스킬 · 에이전트 · MCP
+
+모델이 꺼내 쓰는 내장 도구(폴더/이동/복사/삭제, 여러 파일 읽기, tree, calc, python, serve, download, git, todo, remember/recall, ask_user …)와 하위 에이전트(`agents/`), 디자인·three.js 스킬(`skills/`)이 기본으로 들어 있습니다.
+
+| 명령 | 설명 |
+|---|---|
+| `/tools` | 쓸 수 있는 도구 전체 보기 |
+| `lmw skills add <깃허브 저장소>` · `lmw add --defaults` | 스킬·에이전트·명령을 저장소에서 설치 (라이선스가 허용하는 것만) |
+| `lmw mcp add --defaults` · `lmw mcp presets` | MCP 서버(time, fetch, git, memory, sequential-thinking …) 연결 |
+| `lmw agents` · `lmw cmds` | 하위 에이전트 / 가져온 슬래시 명령 목록 |
+| `lmw find <검색어>` | awesome-claude-code 목록을 실시간 검색 (파일은 번들하지 않음, CC BY-NC-ND) |
+
+시스템 언어로 답하려면 설정의 `language` 또는 환경변수 `LMW_LANG` 을 쓰면 됩니다.
+
 ## 준비물
 
 - 로컬 모델 서버 하나: [Ollama](https://ollama.com) (추천), LM Studio, vLLM, llama.cpp, SGLang, LocalAI, KoboldCpp, Jan, GPT4All 등 17종 — 목록은 `lmw servers`

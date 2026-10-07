@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
+from . import netutil
 from . import __version__
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -26,7 +27,7 @@ def _get(url: str, timeout: float = 15, headers: Optional[Dict[str, str]] = None
     h = {"User-Agent": UA, "Accept-Language": "ko,en;q=0.8"}
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with netutil.urlopen(req, timeout=timeout) as r:
         raw = r.read(3_000_000)
         charset = r.headers.get_content_charset() or "utf-8"
     return raw.decode(charset, errors="replace")

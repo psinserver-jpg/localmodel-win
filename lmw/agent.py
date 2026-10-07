@@ -30,12 +30,16 @@ from . import ui
 from .client import ChatClient, ContextRefit, ModelError
 from .config import Config
 from .events import TOOL_LABELS, emit
+from . import agents as agentlib
+from . import mcp as mcplib
+from . import toolbox
 from .parse import apply_edits, Edit
-from .skills import load_skills, select_skills
+from .skills import all_skills, select_skills
 from .stats import STATS, fmt_tokens
 from .textutil import detect_language, estimate_tokens, looks_like, preferred_language, truncate_to_tokens
 from .workspace import IGNORE_DIRS, UnsafePathError, Workspace
 
+TOOL_LABELS.update(toolbox.labels())
 MODES = ("ask", "auto-edit", "full")
 EFFORTS = ("auto", "low", "medium", "high")
 MAX_STEPS = 40
@@ -111,6 +115,18 @@ class Permissions:
         """(ask?, dangerous?)"""
         if tool in ("read_file", "list_dir", "glob", "grep", "web_search", "web_fetch"):
             return False, False
+        c = toolbox.classify(tool, args)
+        if c is None and tool.startswith("mcp_"):
+            c = mcplib.classify(tool)
+        if c is not None:  # the extra tools and MCP tools: by class
+            cls, danger = c
+            if danger:
+                return True, True
+            if cls == "read":
+                return False, False
+            if cls == "edit":
+                return (self.mode == "ask" and "edit" not in self.always), False
+            return not (self.mode == "full" or "tool:" + tool in self.always), False
         if tool in ("write_file", "edit_file"):
             return (self.mode == "ask" and "edit" not in self.always), False
         if tool == "bash":
@@ -123,7 +139,13 @@ class Permissions:
         return self.mode != "full", False
 
     def remember(self, tool: str, args: Dict) -> None:
-        self.always.add("edit" if tool in ("write_file", "edit_file") else self.bash_key(str(args.get("command", ""))))
+        if tool in ("write_file", "edit_file"):
+            self.always.add("edit")
+        elif tool == "bash":
+            self.always.add(self.bash_key(str(args.get("command", ""))))
+        else:
+            c = toolbox.classify(tool, args)
+            self.always.add("edit" if c and c[0] == "edit" else "tool:" + tool)
 
 
 # -------------------------------------------------------------------- tools
@@ -233,6 +255,10 @@ class Tools:
         self.root = self.ws.root
         self.check_stop = check_stop
         self.rg = shutil.which("rg")
+        self.skills: List = []          # set by the Agent (skill / skill_search tools)
+        self.todos: List[Dict] = []
+        self.ask_cb: Optional[Callable[[str], str]] = None
+        self.agent_cb: Optional[Callable] = None
 
     def _path(self, p: str) -> Path:
         p = str(p or "").strip().strip('"').strip("'")
@@ -436,8 +462,16 @@ class Tools:
         return True, "%s (%d자)" % ((page["title"] or page["url"])[:60], len(page["text"])), \
             "# %s\n%s\n\n%s" % (page["title"], page["url"], page["text"]), {}
 
+    def _mcp_call(self, name: str, args: Dict):
+        return mcplib.manager(str(self.root)).call(name, args, self.check_stop)
+
     def run(self, name: str, args: Dict):
-        fn = getattr(self, name, None) if name in TOOL_LABELS else None
+        if name in toolbox.EXTRAS:
+            fn = lambda **kw: toolbox.call(self, name, kw)  # noqa: E731
+        elif name.startswith("mcp_"):
+            fn = lambda **kw: self._mcp_call(name, kw)  # noqa: E731
+        else:
+            fn = getattr(self, name, None) if name in TOOL_LABELS else None
         if fn is None:
             return False, "알 수 없는 도구: %s" % name, "Unknown tool %r. Available: %s" % (name, ", ".join(TOOL_LABELS)), {}
         try:
@@ -473,9 +507,32 @@ def tool_title(name: str, args: Dict) -> str:
         arg = str(args.get("pattern", ""))
         if name == "grep" and args.get("path") not in (None, "", "."):
             arg += " in " + str(args["path"])
+    elif name in ("skill_search",):
+        arg = str(args.get("query", ""))
+    elif name == "agent":
+        arg = "%s: %s" % (args.get("name", ""), args.get("task", ""))
+    elif name == "move_file" or name == "copy_file":
+        arg = "%s → %s" % (args.get("src", ""), args.get("dest", ""))
+    elif name == "download":
+        arg = "%s → %s" % (args.get("url", ""), args.get("path", ""))
+    elif name == "skill":
+        arg = str(args.get("name", "")) + ("/" + str(args["topic"]) if args.get("topic") else "")
+    elif name.startswith("mcp_") or name in toolbox.EXTRAS:
+        arg = ""
+        for k in ("path", "target", "args", "expression", "code", "question", "note", "items", "paths", "names", "url"):
+            v = args.get(k)
+            if v:
+                arg = ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+                break
+        if not arg and args:
+            arg = ", ".join("%s=%s" % (k, str(v)[:30]) for k, v in list(args.items())[:3])
+        if not arg and name in ("tree", "serve"):
+            arg = "."
     else:
         arg = str(args.get("path", "."))
     arg = arg.replace("\n", " ")
+    if name.startswith("mcp_"):
+        label = name[4:]
     return "%s(%s)" % (label, arg[:100] + ("…" if len(arg) > 100 else ""))
 
 
@@ -598,7 +655,69 @@ class Agent:
         self.tools = Tools(self.root, self.check_stop)
         self.tools.searxng = getattr(cfg, "search_url", "")
         self.history: List[Dict[str, str]] = []
-        self._skills = load_skills(cfg.resolved_skills_dir())
+        self._skills = all_skills(cfg.resolved_skills_dir())
+        self.sub = False                 # True: running as a sub-agent for another agent
+        self.persona: Optional[agentlib.Persona] = None
+        self.max_steps = MAX_STEPS
+        self.ask_user_cb: Optional[Callable[[str], str]] = None
+        self._personas: Optional[Dict[str, agentlib.Persona]] = None
+        self.tools.skills = self._skills
+        self.tools.ask_cb = lambda q: self.ask_user_cb(q) if self.ask_user_cb else None
+        self.tools.agent_cb = lambda n, t: agentlib.run_sub(self, n, t)
+
+    def personas(self) -> Dict[str, "agentlib.Persona"]:
+        if self._personas is None:
+            try:
+                self._personas = agentlib.load_agents()
+            except OSError:
+                self._personas = {}
+        return self._personas
+
+    def _mcp(self):
+        try:
+            m = mcplib.manager(str(self.root))
+            return m if m.servers else None
+        except Exception:
+            return None
+
+    def _skill_catalog(self) -> str:
+        own = [s.name for s in self._skills if not s.library]
+        lib = sum(1 for s in self._skills if s.library)
+        if not own and not lib:
+            return ""
+        more = " Plus %d installed library skills: find them with skill_search(query)." % lib if lib else ""
+        return "# Skills (expert playbooks: read one with skill(name) BEFORE building something it covers)\n%s.%s" % (", ".join(own), more)
+
+    def _project_notes(self) -> str:
+        f = self.root / ".lmw" / "memory.md"
+        try:
+            lines = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()][-12:]
+        except OSError:
+            return ""
+        return ("# Project notes (saved earlier with remember)\n" + "\n".join(lines))[:900] if lines else ""
+
+    def _more_tools(self, readonly: bool) -> str:
+        parts = [toolbox.docs(include_agent=not self.sub, read_only=readonly)]
+        if not self.sub:
+            cat = agentlib.catalog(self.personas())
+            if cat:
+                parts.append(cat)
+        m = self._mcp()
+        if m:
+            d = m.docs(read_only=readonly)
+            if d:
+                parts.append(d)
+        parts += [x for x in (self._skill_catalog(), self._project_notes()) if x]
+        return "\n\n".join(parts)
+
+    def _schemas(self, readonly: bool) -> List[Dict]:
+        out = [t for t in TOOL_SCHEMAS if not (readonly and t["function"]["name"] in ("write_file", "edit_file", "bash"))]
+        if self.cfg.context_tokens >= 12000:  # small contexts keep only the text catalog
+            out += toolbox.schemas(include_agent=not self.sub, read_only=readonly)
+            m = self._mcp()
+            if m:
+                out += m.schemas(read_only=readonly)
+        return out
 
     def check_stop(self) -> None:
         if self.stop.is_set():
@@ -616,11 +735,13 @@ class Agent:
         tools = TOOL_DOCS % shell_name()
         if readonly:
             tools = "\n".join(l for l in tools.splitlines() if not l.startswith(("- write_file", "- edit_file", "- bash")))
-        return SYSTEM.format(cwd=self.root, os="%s %s" % (platform.system(), platform.release()),
+        tools += "\n\n" + self._more_tools(readonly)
+        prompt = SYSTEM.format(cwd=self.root, os="%s %s" % (platform.system(), platform.release()),
                              envnotes=environment_notes(self.root),
                              date=time.strftime("%Y-%m-%d"), tools=tools,
                              language=self._lang(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
                              tree=tree, skills=skills)
+        return (agentlib.persona_prompt(self.persona) + "\n" + prompt) if self.persona else prompt
 
     # ------------------------------------------------------- auto-compaction
     _readonly = False
@@ -777,9 +898,7 @@ class Agent:
                 emit("thinking_live", id=live["id"], text=b.replace("<think>", "").strip())
 
         try:
-            extra = {"refit": True, "tools": TOOL_SCHEMAS if not self._readonly else
-                     [t for t in TOOL_SCHEMAS if t["function"]["name"] not in ("write_file", "edit_file", "bash")]} \
-                if refit else {}
+            extra = {"refit": True, "tools": self._schemas(self._readonly)} if refit else {}
             res = self.client.chat(messages, on_token=tap, think=think, **extra)
         finally:
             progress.done()
@@ -803,13 +922,13 @@ class Agent:
         think = None if effort in ("medium", "high") else False  # simple requests: model's thinking off
         self.reply_lang = self._lang(text)
         self._readonly = readonly
-        nudges = 0
+        nudges = 3 if self.sub else 0
         self._wrote = 0  # files created/changed in this request
         for t in self._interjections():  # typed before the first step: part of the request
             self._add_interjection(t)
         self.history.append({"role": "user", "content": text})
         final = ""
-        for step in range(MAX_STEPS):
+        for step in range(self.max_steps):
             self.check_stop()
             system = self._system(text, effort, readonly)
             self.maybe_compact(system)  # summarize old messages before the context overflows
@@ -826,11 +945,12 @@ class Agent:
             if thinking and not self.last_think:  # (already shown live when the answer started)
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))
             calls, prose = parse_tool_calls(visible)
-            if prose and not calls:  # the closing answer: always in the user's language
+            if prose and not calls and not self.sub:  # the closing answer: always in the user's language
                 prose = self._in_language(prose)
                 visible = prose
             if prose:
-                emit("assistant", text=prose)
+                if not self.sub:  # a sub-agent's words go back to the main agent, not to the chat
+                    emit("assistant", text=prose)
                 final = prose
             self.history.append({"role": "assistant", "content": visible or raw})
             if not calls:  # about to stop: first handle anything the user added meanwhile, in order
@@ -854,7 +974,7 @@ class Agent:
                     "until my original request is fully done:\n" + text[:1500])})
                 continue
             if not calls:
-                if finish == "length" and step < MAX_STEPS - 1:
+                if finish == "length" and step < self.max_steps - 1:
                     self.history.append({"role": "user", "content": "Your reply was cut off. Continue exactly where you stopped."})
                     continue
                 break
@@ -870,7 +990,7 @@ class Agent:
                     emit("user", text=t, interject=True)
             self.history.append({"role": "user", "content": "\n".join(results)})
         else:
-            emit("notice", level="warn", text="작업 단계가 너무 많아 멈췄습니다 (%d단계). 이어서 하려면 '계속'이라고 입력하세요." % MAX_STEPS)
+            emit("notice", level="warn", text="작업 단계가 너무 많아 멈췄습니다 (%d단계). 이어서 하려면 '계속'이라고 입력하세요." % self.max_steps)
         return final
 
     def _execute(self, call: Dict, readonly: bool) -> str:
@@ -881,13 +1001,16 @@ class Agent:
         cid = "t%d_%d" % (int(time.time()), self._n)
         title = tool_title(name, args)
         emit("tool", id=cid, name=name, title=title, input=_brief_input(name, args))
-        if readonly and name in ("write_file", "edit_file", "bash"):
+        klass = toolbox.classify(name, args) or (mcplib.classify(name) if name.startswith("mcp_") else None)
+        if readonly and (name in ("write_file", "edit_file", "bash") or (klass is not None and klass[0] != "read")):
             emit("tool_result", id=cid, ok=False, summary="질문 모드에서는 변경할 수 없음")
             return _result(name, False, "This is read-only question mode; do not modify files or run commands.")
         ask, danger = self.perms.needs_ask(name, args)
         if ask:
             pid = "p" + cid[1:]
-            detail = str(args.get("command") or args.get("path") or "")
+            detail = str(args.get("command") or args.get("path") or args.get("code") or args.get("url") or args.get("args") or "")
+            if not detail and args:
+                detail = ", ".join("%s=%s" % (k, str(v)[:80]) for k, v in list(args.items())[:4])
             req = {"id": pid, "tool": name, "title": _perm_title(name, args), "detail": detail, "danger": danger}
             if name in ("write_file", "edit_file"):
                 req["diff"] = _clip(self.tools.preview(name, args), 6000)
@@ -926,6 +1049,14 @@ def _perm_title(name: str, args: Dict) -> str:
         return "파일 쓰기: %s" % args.get("path", "")
     if name == "edit_file":
         return "파일 수정: %s" % args.get("path", "")
+    nice = {"delete_file": "삭제: %s" % args.get("path", ""), "move_file": "이동: %s → %s" % (args.get("src", ""), args.get("dest", "")),
+            "copy_file": "복사: %s → %s" % (args.get("src", ""), args.get("dest", "")), "make_dir": "폴더 만들기: %s" % args.get("path", ""),
+            "python": "파이썬 실행", "serve": "웹 서버 시작: %s" % args.get("path", "."), "open_url": "브라우저로 열기: %s" % args.get("target", ""),
+            "download": "다운로드: %s" % args.get("url", ""), "git": "git %s" % str(args.get("args", ""))[:60]}
+    if name in nice:
+        return nice[name]
+    if name.startswith("mcp_"):
+        return "외부 도구(MCP) 실행: %s" % name[4:]
     return "%s 실행" % name
 
 

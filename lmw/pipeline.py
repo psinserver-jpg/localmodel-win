@@ -41,7 +41,7 @@ from .parse import (
     plan_files,
 )
 from .prompts import Slot, Templates, files_block, fit_files, render
-from .skills import Skill, load_skills, select_references, select_skills
+from .skills import Skill, all_skills, select_references, select_skills
 from .textutil import estimate_tokens, language_rule, tail_tokens
 from .workspace import Workspace
 
@@ -66,7 +66,7 @@ class Pipeline:
         self.quiet = False  # chat shell: no per-phase details, only the result
         self.client = client or ChatClient(cfg)
         self.templates = Templates(cfg.resolved_prompts_dir())
-        self.all_skills = load_skills(cfg.resolved_skills_dir())
+        self.all_skills = all_skills(cfg.resolved_skills_dir())
         self.ask = ask
         self.approve = approve  # callback(blocks) -> blocks the user accepted
 

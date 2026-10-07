@@ -23,6 +23,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from . import netutil
 from . import ui
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -90,7 +91,7 @@ def _req1(method: str, url: str, body: Optional[dict] = None, token: str = "", t
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with netutil.urlopen(req, timeout=timeout) as r:
         return r.status, json.loads(r.read().decode("utf-8") or "{}")
 
 

@@ -17,6 +17,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+from . import netutil
 from .config import Config
 from .stats import STATS
 
@@ -348,7 +349,7 @@ class ChatClient:
     def _post_json(self, url: str, body: dict, timeout: float = 60) -> dict:
         req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=self._headers())
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with netutil.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as e:
             raise ModelError("HTTP %s: %s" % (e.code, _peek(e)))
@@ -371,7 +372,7 @@ class ChatClient:
     def _get_json(self, url: str) -> dict:
         req = urllib.request.Request(url, headers=self._headers())
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with netutil.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             raise ModelError(self._explain(e))
@@ -379,7 +380,7 @@ class ChatClient:
     def _post_stream(self, url: str, body: dict):
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
-        return urllib.request.urlopen(req, timeout=self.cfg.timeout)
+        return netutil.urlopen(req, timeout=self.cfg.timeout)
 
     def _chat_openai(self, messages, temperature, max_tokens, on_token) -> ChatResult:
         base = self._ollama_base() + "/v1" if self.cfg.provider == "ollama" else self.cfg.base_url.rstrip("/")

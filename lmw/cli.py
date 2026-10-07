@@ -15,7 +15,7 @@ from .client import ChatClient, ModelError
 from .config import Config, load_config
 from .exporter import build_commands, build_prompt
 from .pipeline import Pipeline, read_request
-from .skills import load_skills, select_skills
+from .skills import all_skills, select_skills
 from .workspace import Workspace
 
 
@@ -96,17 +96,71 @@ def cmd_resume(args) -> int:
     return 0 if state.get("status") == "done" else 1
 
 
-def cmd_skills(args) -> int:
+def _words(args) -> list:
+    return [w for w in (getattr(args, "words", None) or []) if w != "--"]
+
+
+def cmd_mcp(args) -> int:
+    from . import mcp
+    r = mcp.run_command(_words(args) or ["list"], os.getcwd())
+    if r is None:
+        print("usage: lmw mcp add <preset> | add --defaults | add <name> -- <command...> | list | tools | refresh | remove <name> | import <url>")
+        return 2
+    return r
+
+
+def cmd_agents(args) -> int:
+    from . import skillhub
+    return skillhub.run_docs_command("agents", _words(args))
+
+
+def cmd_cmds(args) -> int:
+    from . import skillhub
+    return skillhub.run_docs_command("commands", _words(args))
+
+
+def cmd_add(args) -> int:
+    from . import skillhub
+    return skillhub.run_pack_command("add", _words(args))
+
+
+def cmd_find(args) -> int:
+    from . import skillhub
+    return skillhub.run_pack_command("find", _words(args))
+
+
+def cmd_tools(args) -> int:
+    from . import toolbox
     cfg = _cfg(args)
-    skills = load_skills(cfg.resolved_skills_dir())
-    picked = {s.name for s in select_skills(skills, args.text)} if args.text else set()
-    for s in skills:
+    for line in toolbox.overview(cfg, os.getcwd()):
+        print(line)
+    return 0
+
+
+def cmd_skills(args) -> int:
+    from . import skillhub
+    words = list(args.text or [])
+    done = skillhub.run_command(words)  # lmw skills add|remove|list ...
+    if done is not None:
+        return done
+    text = " ".join(words)
+    cfg = _cfg(args)
+    skills = all_skills(cfg.resolved_skills_dir())
+    picked = {s.name for s in select_skills(skills, text)} if text else set()
+    own = [s for s in skills if not s.library]
+    lib = [s for s in skills if s.library]
+    for s in own:
         mark = "*" if s.name in picked else " "
         print("%s %-16s p=%-3d %s" % (mark, s.name, s.priority, s.description))
         if s.references:
             print("    references: " + ", ".join(r.name for r in s.references))
-    if args.text:
-        print("\n* = selected for: %r" % args.text)
+    if lib:
+        shown = [s for s in lib if s.name in picked] if text else lib[:0]
+        print("\n설치한 외부 스킬 %d개 (lmw skills list 로 목록, 뚜렷하게 맞을 때만 사용됨)" % len(lib))
+        for s in shown:
+            print("* %-24s %s" % (s.name, s.description[:90]))
+    if text:
+        print("\n* = selected for: %r" % text)
     return 0
 
 
@@ -208,7 +262,7 @@ def cmd_doctor(args) -> int:
     ui.info("context: %d tokens, answer budget: %d, prompt budget: %d" % (
         cfg.context_tokens, cfg.max_output_tokens, cfg.input_budget()))
     try:
-        ui.ok("skills dir: %s (%d skills)" % (cfg.resolved_skills_dir(), len(load_skills(cfg.resolved_skills_dir()))))
+        ui.ok("skills dir: %s (%d skills)" % (cfg.resolved_skills_dir(), len(all_skills(cfg.resolved_skills_dir()))))
         ui.ok("prompts dir: %s" % cfg.resolved_prompts_dir())
     except FileNotFoundError as e:
         ui.err(str(e))
@@ -271,8 +325,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_workflow_args(rs)
     rs.set_defaults(func=cmd_resume)
 
-    s = sub.add_parser("skills", help="list skills (optionally show which a text would select)")
-    s.add_argument("text", nargs="?", help="sample request to test skill routing")
+    s = sub.add_parser("skills", help="list skills; `skills add <github url>` installs more; `skills remove|list`")
+    s.add_argument("text", nargs=argparse.REMAINDER, help="a sample request to test skill routing, or: add|remove|list ...")
     s.add_argument("--config")
     s.set_defaults(func=cmd_skills)
 
@@ -320,6 +374,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     lo = sub.add_parser("logout", help="log out this computer")
     lo.set_defaults(func=cmd_logout)
+
+    for nm, fn, hp in (("mcp", cmd_mcp, "connect MCP servers (tools for the model): add|list|tools|remove|import"),
+                       ("agents", cmd_agents, "sub-agents the model can call: list | add <github url> | remove"),
+                       ("cmds", cmd_cmds, "imported slash commands: list | add <github url> | remove"),
+                       ("add", cmd_add, "install skills + agents + commands from a GitHub repo in one go"),
+                       ("find", cmd_find, "search the awesome-claude-code list for tools to add"),
+                       ("tools", cmd_tools, "show every tool, skill, agent and MCP server available")):
+        sp = sub.add_parser(nm, help=hp)
+        sp.add_argument("words", nargs=argparse.REMAINDER)
+        sp.add_argument("--config")
+        sp.set_defaults(func=fn)
 
     up = sub.add_parser("update", help="update lmw to the latest version")
     up.set_defaults(func=lambda a: 0 if __import__("lmw.updater", fromlist=["update"]).update() else 1)

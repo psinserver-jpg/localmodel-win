@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .config import Config
-from .skills import load_skills, select_skills
+from .skills import all_skills, select_skills
 from .textutil import estimate_tokens, truncate_to_tokens
 
 HEADER = """# LMW Skill Pack (system prompt)
@@ -19,7 +19,7 @@ to the request.
 
 def build_prompt(cfg: Config, names: List[str], compact: bool = False, references: bool = False,
                  for_text: str = "", budget: Optional[int] = None) -> str:
-    skills = load_skills(cfg.resolved_skills_dir())
+    skills = all_skills(cfg.resolved_skills_dir())
     if for_text:
         skills = select_skills(skills, for_text, force=names)
     elif names:

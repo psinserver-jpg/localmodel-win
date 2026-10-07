@@ -26,7 +26,7 @@ from .client import ChatClient, ModelError, strip_reasoning
 from .config import Config
 from .parse import FileBlock, apply_edits
 from .pipeline import Pipeline
-from .skills import load_skills, select_skills
+from .skills import all_skills, select_skills
 from .textutil import estimate_tokens, language_rule, tail_tokens, truncate_to_tokens
 from .workspace import Workspace
 
@@ -64,6 +64,13 @@ COMMANDS = [
     ("/stats", "시간 · 토큰 · 속도 통계", "설정"),
     ("/statusline", "상태줄 항목 변경", "설정"),
     ("/config", "현재 설정 보기", "설정"),
+    ("/tools", "쓸 수 있는 도구·스킬·에이전트·MCP 전체 보기", "도구"),
+    ("/mcp", "MCP 서버 연결 (add 이름 | list | tools | remove)", "도구"),
+    ("/agents", "하위 에이전트 (list | add <GitHub 주소> | remove)", "도구"),
+    ("/cmds", "가져온 슬래시 명령 (list | add <주소> | remove)", "도구"),
+    ("/cmd", "가져온 슬래시 명령 실행 (/cmd 이름 인자)", "도구"),
+    ("/add", "GitHub 저장소에서 스킬·에이전트·명령을 한 번에 설치", "도구"),
+    ("/find", "awesome-claude-code 목록에서 도구 찾기 (/find security)", "도구"),
     ("/watch", "다른 컴퓨터의 lmw 화면 보기·조작", "계정"),
     ("/web", "이 화면을 웹에서 보는 주소", "계정"),
     ("/update", "lmw 최신 버전으로 업데이트 (자동 재시작)", "계정"),
@@ -547,9 +554,15 @@ class Shell:
             else:
                 ui.warn("사용법: /rounds 5")
         elif cmd == "/skills":
-            for s in load_skills(self.cfg.resolved_skills_dir()):
-                mark = "+" if s.name in self.cfg.skills else " "
-                print(" %s %-16s %s" % (mark, s.name, s.description[:90]))
+            from . import skillhub
+            if skillhub.run_command(arg.split(), log=ui.info) is None:  # /skills add <url> | remove | list
+                skills = all_skills(self.cfg.resolved_skills_dir())
+                for s in [x for x in skills if not x.library]:
+                    mark = "+" if s.name in self.cfg.skills else " "
+                    print(" %s %-16s %s" % (mark, s.name, s.description[:90]))
+                lib = [x for x in skills if x.library]
+                if lib:
+                    ui.info("설치한 외부 스킬 %d개 — /skills list · /skills add <GitHub 주소> · /skills remove <이름>" % len(lib))
         elif cmd == "/skill":
             if not arg:
                 ui.warn("사용법: /skill web-design")
@@ -613,9 +626,55 @@ class Shell:
         elif cmd == "/config":
             for k, v in self.cfg.to_dict().items():
                 print("   %-20s %s" % (k, v))
+        elif cmd == "/tools":
+            self._tools_overview()
+        elif cmd == "/mcp":
+            from . import mcp
+            if mcp.run_command(arg.split() or ["list"], str(self.root), log=ui.info) is None:
+                ui.info("사용법: /mcp add <time|fetch|git|memory|…> · /mcp add --defaults · /mcp list · /mcp tools · /mcp remove <이름> · /mcp import <주소>")
+        elif cmd in ("/agents", "/cmds"):
+            self._docs_command("agents" if cmd == "/agents" else "commands", arg.split())
+        elif cmd == "/add":
+            from . import skillhub
+            skillhub.run_pack_command("add", arg.split(), ui.info)
+        elif cmd == "/find":
+            from . import skillhub
+            skillhub.run_pack_command("find", arg.split(), ui.info)
+        elif cmd == "/cmd":
+            name, _, rest = arg.partition(" ")
+            return self._run_user_command(name, rest)
+        elif cmd[1:] in self._user_commands():
+            return self._run_user_command(cmd[1:], arg)
         else:
             ui.warn("알 수 없는 명령: %s  (/help)" % cmd)
         return None
+
+    # ----------------------------------------------- imported agents / commands
+    def _user_commands(self) -> Dict:
+        from . import usercmds
+        try:
+            return usercmds.load()
+        except Exception:
+            return {}
+
+    def _run_user_command(self, name: str, args: str) -> Optional[str]:
+        from . import usercmds
+        cmds = self._user_commands()
+        c = cmds.get(name.strip().lower().lstrip("/"))
+        if c is None:
+            ui.warn("가져온 명령이 없습니다: %s   (/cmds list · /cmds add <GitHub 주소>)" % name)
+            return None
+        ui.info(ui.dim("↳ /%s%s" % (c.name, (" " + args) if args.strip() else "")))
+        self.handle(usercmds.expand(c, args), route_override="agent")
+        return None
+
+    def _docs_command(self, kind: str, words: List[str]) -> None:
+        from . import skillhub
+        skillhub.run_docs_command(kind, words, ui.info)
+
+    def _tools_overview(self) -> None:
+        from . import toolbox
+        ui.box("도구", toolbox.overview(self.cfg, self.root))
 
     # ----------------------------------------------------------------- task
     # ------------------------------------------------------------- agent turn
@@ -624,6 +683,7 @@ class Shell:
         if self.agent is None:
             self.agent = Agent(self.cfg, self.root, self.client, self.ask_permission, self.perms, self.stop_event)
         self.agent.interject = self._take_interjections
+        self.agent.ask_user_cb = self._ask_user
         return self.agent
 
     def _take_interjections(self) -> List[str]:
@@ -1298,7 +1358,7 @@ class Shell:
     # ------------------------------------------------------------------ ask
     def ask(self, question: str) -> None:
         ws = Workspace(self.root)
-        skills = select_skills(load_skills(self.cfg.resolved_skills_dir()), question, self.cfg.skills)
+        skills = select_skills(all_skills(self.cfg.resolved_skills_dir()), question, self.cfg.skills)
         guide = "\n\n".join(s.body for s in skills if not s.always)
         system = ASK_SYSTEM % (language_rule(question, self.cfg.language), ws.tree())
         if guide:

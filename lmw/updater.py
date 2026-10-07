@@ -19,19 +19,20 @@ import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
+from . import netutil
 from . import __version__, ui
 
 REPO = "psinserver-jpg/localmodel-win"
 BRANCH = os.environ.get("LMW_BRANCH", "main")
 APP = Path(__file__).resolve().parent.parent  # the install folder (contains lmw/, skills/, prompts/)
-PARTS = ("lmw", "skills", "prompts", "README.md", "LICENSE", "install.ps1", "install.sh")
+PARTS = ("lmw", "skills", "agents", "prompts", "README.md", "LICENSE", "install.ps1", "install.sh")
 
 latest: Optional[str] = None  # filled in by check_in_background()
 
 
 def _get(url: str, timeout: float = 30) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "lmw-cli/%s" % __version__})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with netutil.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 

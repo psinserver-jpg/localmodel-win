@@ -11,6 +11,7 @@ agents, plus a few extra keys (triggers, priority, always) that LMW uses for rou
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +74,8 @@ class Skill:
     checklist: str = ""
     references: List[Reference] = field(default_factory=list)
     path: Optional[Path] = None
+    library: bool = False  # installed from outside (lmw skills add): only used when it clearly matches
+    source: str = ""  # where a library skill came from, e.g. "owner/repo"
 
     def score(self, text: str) -> int:
         return trigger_score(self.triggers, text)
@@ -128,6 +131,8 @@ def load_skill(directory: Path) -> Optional[Skill]:
         triggers=_as_list(meta.get("triggers")),
         priority=int(meta.get("priority") or 0),  # type: ignore[arg-type]
         always=bool(meta.get("always")),
+        library=bool(meta.get("library")),
+        source=str(meta.get("source") or ""),
         checklist=checklist_file.read_text(encoding="utf-8").strip() if checklist_file.is_file() else "",
         references=refs,
         path=directory,
@@ -136,10 +141,32 @@ def load_skill(directory: Path) -> Optional[Skill]:
 
 def load_skills(skills_dir: Path) -> List[Skill]:
     skills = []
-    for d in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
-        s = load_skill(d)
+    if not skills_dir.is_dir():
+        return skills
+    for d in sorted(p for p in skills_dir.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        try:
+            s = load_skill(d)
+        except (OSError, ValueError):  # one broken skill must not take the others down
+            continue
         if s:
             skills.append(s)
+    return skills
+
+
+def user_skills_dir() -> Path:
+    """Skills the user installed (lmw skills add ...): ~/.lmw/skills"""
+    return Path(os.environ.get("LMW_HOME") or (Path.home() / ".lmw")) / "skills"
+
+
+def all_skills(builtin_dir: Path) -> List[Skill]:
+    """The skills that ship with lmw plus the ones installed by the user (built-in names win)."""
+    skills = load_skills(builtin_dir)
+    have = {s.name.lower() for s in skills}
+    for s in load_skills(user_skills_dir()):
+        if s.name.lower() not in have:
+            s.library = True  # anything installed from outside is a library skill
+            skills.append(s)
+            have.add(s.name.lower())
     return skills
 
 
@@ -155,6 +182,7 @@ def select_skills(
     exclude = [e.lower() for e in (exclude or [])]
     chosen: List[Skill] = []
     scored: List[Tuple[int, int, Skill]] = []
+    library: List[Tuple[int, int, Skill]] = []
     for s in skills:
         if s.name.lower() in exclude:
             continue
@@ -162,10 +190,17 @@ def select_skills(
             chosen.append(s)
             continue
         sc = s.score(text)
-        if sc > 0:
+        if s.library:
+            if sc >= 2 or (sc >= 1 and s.name.lower() in text.lower()):  # installed skills must match clearly
+                library.append((sc, s.priority, s))
+        elif sc > 0:
             scored.append((sc, s.priority, s))
     scored.sort(key=lambda x: (-x[0], -x[1]))
-    for _, _, s in scored[:max_skills]:
+    library.sort(key=lambda x: (-x[0], -x[1]))
+    picked = [s for _, _, s in scored[:max_skills]]
+    room = max_skills - len(picked)  # the curated skills come first; installed ones fill what is left
+    picked += [s for _, _, s in library[:min(room, 2)]]
+    for s in picked:
         chosen.append(s)
     chosen.sort(key=lambda s: -s.priority)
     return chosen

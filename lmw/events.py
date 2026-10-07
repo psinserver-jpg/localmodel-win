@@ -217,6 +217,13 @@ def render(e: Event, verbose: bool = False) -> None:
         print(ui.red("  ✘ " + str(e.get("text", ""))))
     elif t == "file":
         print(ui.dim("  📎 웹에서 받은 파일 저장: %s (%s)" % (e.get("path"), _size(e.get("size")))))
+    elif t == "todo":
+        marks = {"done": ui.green("☒"), "doing": ui.accent("◐"), "pending": ui.dim("☐")}
+        items = list(e.get("items") or [])
+        print()
+        for it in items[:20]:
+            text = str(it.get("text", ""))
+            print("  %s %s" % (marks.get(it.get("status"), "☐"), ui.dim(text) if it.get("status") == "done" else text))
     elif t == "turn_end":
         if e.get("stats"):
             print(ui.dim("\n  " + str(e["stats"])))
