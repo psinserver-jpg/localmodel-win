@@ -533,10 +533,35 @@ class Agent:
     def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None],
               think: Optional[bool] = None) -> Tuple[str, str]:
         progress = ui.Progress(self.cfg.verbose, show_status=False)  # stats are shown once per turn
+        self._n = getattr(self, "_n", 0) + 1
+        live = {"id": "th%d_%d" % (int(time.time()), self._n), "buf": "", "on": False, "done": False,
+                "t0": time.time(), "last": 0.0}
+        self.last_think = None
 
         def tap(piece: str) -> None:
             self.check_stop()
             progress(piece)
+            if live["done"]:
+                return
+            live["buf"] += piece
+            b = live["buf"]
+            if not live["on"]:
+                if "<think>" in b or ("</think>" in b and "<think>" not in b):
+                    live["on"] = True
+                elif len(b.lstrip()) > 8:
+                    live["done"] = True  # no thinking in this answer
+                    return
+            if "</think>" in b:  # the answer starts now: show the finished thinking (folded)
+                text = b.split("</think>", 1)[0].replace("<think>", "").strip()
+                live["done"] = True
+                if text:
+                    secs = round(time.time() - live["t0"], 1)
+                    emit("thinking", id=live["id"], text=text, seconds=secs)
+                    self.last_think = live["id"]
+                return
+            if time.time() - live["last"] > 0.4:
+                live["last"] = time.time()
+                emit("thinking_live", id=live["id"], text=b.replace("<think>", "").strip())
 
         try:
             res = self.client.chat(messages, on_token=tap, think=think)
@@ -567,7 +592,7 @@ class Agent:
             t0 = time.time()
             raw, finish = self._call(self._fit(system), lambda s: None, think=think)
             thinking, visible = split_thinking(raw)
-            if thinking:
+            if thinking and not self.last_think:  # (already shown live when the answer started)
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))
             calls, prose = parse_tool_calls(visible)
             if prose:

@@ -483,6 +483,11 @@ class Bridge:
         e = dict(e)
         ch = self.channel(e.pop("_sid", None))
         with self._lock:
+            if e["type"] == "thinking_live":  # streaming thoughts: latest text only, not stored as history
+                ch.meta["live_think"] = {"id": e.get("id", ""), "text": str(e.get("text", ""))[-20000:]}
+                return
+            if e["type"] in ("thinking", "assistant", "turn_end", "tool"):
+                ch.meta["live_think"] = {}  # the final thinking / the answer replaces the live view
             self._flush_log_locked(ch)
             ch.events.append(e)
 
