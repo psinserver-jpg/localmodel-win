@@ -531,10 +531,10 @@ class Agent:
         return [{"role": "system", "content": system}] + msgs
 
     def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None],
-              think: Optional[bool] = None) -> Tuple[str, str]:
+              think: Optional[bool] = None, show_thinking: bool = True) -> Tuple[str, str]:
         progress = ui.Progress(self.cfg.verbose, show_status=False)  # stats are shown once per turn
         self._n = getattr(self, "_n", 0) + 1
-        live = {"id": "th%d_%d" % (int(time.time()), self._n), "buf": "", "on": False, "done": False,
+        live = {"id": "th%d_%d" % (int(time.time()), self._n), "buf": "", "on": False, "done": not show_thinking,
                 "t0": time.time(), "last": 0.0}
         self.last_think = None
 
@@ -573,7 +573,7 @@ class Agent:
     def chat(self, text: str) -> str:
         self.history.append({"role": "user", "content": text})
         msgs = [{"role": "system", "content": CHAT_SYSTEM.format(language=detect_language(text))}] + self.history[-6:]
-        raw, _ = self._call(msgs, lambda s: None, think=False)
+        raw, _ = self._call(msgs, lambda s: None, think=False, show_thinking=False)
         thinking, visible = split_thinking(raw)
         reply = visible.strip() or raw.strip()
         self.history.append({"role": "assistant", "content": reply})
