@@ -33,7 +33,7 @@ from .events import TOOL_LABELS, emit
 from .parse import apply_edits, Edit
 from .skills import load_skills, select_skills
 from .stats import STATS, fmt_tokens
-from .textutil import detect_language, estimate_tokens, truncate_to_tokens
+from .textutil import detect_language, estimate_tokens, looks_like, preferred_language, truncate_to_tokens
 from .workspace import IGNORE_DIRS, UnsafePathError, Workspace
 
 MODES = ("ask", "auto-edit", "full")
@@ -574,7 +574,7 @@ class Agent:
             tools = "\n".join(l for l in tools.splitlines() if not l.startswith(("- write_file", "- edit_file", "- bash")))
         return SYSTEM.format(cwd=self.root, os="%s %s" % (platform.system(), platform.release()),
                              date=time.strftime("%Y-%m-%d"), tools=tools,
-                             language=detect_language(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
+                             language=self._lang(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
                              tree=tree, skills=skills)
 
     # ------------------------------------------------------- auto-compaction
@@ -635,7 +635,7 @@ class Agent:
         transcript = "\n\n".join(lines)
         if len(transcript) > room:  # keep the start (the goal) and the most recent part
             transcript = transcript[: room // 3] + "\n\n[… middle omitted …]\n\n" + transcript[-(room * 2 // 3):]
-        lang = detect_language(next((m["content"] for m in head if m["role"] == "user"), ""))
+        lang = self._lang(next((m["content"] for m in head if m["role"] == "user"), ""))
         msgs = [{"role": "system", "content": "You compress a coding-agent conversation so work can continue without it. "
                  "Be faithful and specific; never invent anything."},
                 {"role": "user", "content": "Summarize this conversation in %s with these sections:\n"
@@ -673,7 +673,30 @@ class Agent:
             total -= estimate_tokens(msgs.pop(0)["content"])
         while msgs and msgs[0]["role"] != "user":
             msgs.pop(0)
+        lang = getattr(self, "reply_lang", "")
+        if lang and lang != "English" and msgs and msgs[-1]["role"] == "user":
+            msgs[-1]["content"] += "\n\n[Reply to the user in %s — not English. Code and file names stay as they are.]" % lang
         return [{"role": "system", "content": system}] + msgs
+
+    def _lang(self, text: str = "") -> str:
+        """Reply language: config `language`, else the request's script, else the computer's language."""
+        return preferred_language(text, getattr(self.cfg, "language", "auto"))
+
+    def _in_language(self, prose: str) -> str:
+        """The final answer must be in the user's language: if the model slipped into English, translate it."""
+        lang = getattr(self, "reply_lang", "")
+        if not lang or looks_like(prose, lang) or len(prose) < 60:
+            return prose
+        try:
+            raw, _ = self._call(
+                [{"role": "system", "content": "You are a precise translator. Output only the translation."},
+                 {"role": "user", "content": "Translate this message to %s. Keep code blocks, commands, file names, "
+                  "identifiers and URLs exactly as they are; keep the markdown structure.\n\n%s" % (lang, prose)}],
+                lambda s: None, think=False, show_thinking=False)
+            out = split_thinking(raw)[1].strip()
+        except ModelError:
+            return prose
+        return out if out and len(out) > len(prose) * 0.3 else prose
 
     def _call(self, messages: List[Dict[str, str]], status: Callable[[str], None],
               think: Optional[bool] = None, show_thinking: bool = True, refit: bool = False) -> Tuple[str, str]:
@@ -720,7 +743,8 @@ class Agent:
     # ------------------------------------------------------------------- run
     def chat(self, text: str) -> str:
         self.history.append({"role": "user", "content": text})
-        msgs = [{"role": "system", "content": CHAT_SYSTEM.format(language=detect_language(text))}] + self.history[-6:]
+        self.reply_lang = self._lang(text)
+        msgs = [{"role": "system", "content": CHAT_SYSTEM.format(language=self.reply_lang)}] + self.history[-6:]
         raw, _ = self._call(msgs, lambda s: None, think=False, show_thinking=False)
         thinking, visible = split_thinking(raw)
         reply = visible.strip() or raw.strip()
@@ -732,6 +756,7 @@ class Agent:
         if effort == "auto":
             effort = "medium" if wants_thinking(text, "auto") else "none"
         think = None if effort in ("medium", "high") else False  # simple requests: model's thinking off
+        self.reply_lang = self._lang(text)
         self._readonly = readonly
         nudges = 0
         self._wrote = 0  # files created/changed in this request
@@ -756,6 +781,9 @@ class Agent:
             if thinking and not self.last_think:  # (already shown live when the answer started)
                 emit("thinking", text=thinking, seconds=round(time.time() - t0, 1))
             calls, prose = parse_tool_calls(visible)
+            if prose and not calls:  # the closing answer: always in the user's language
+                prose = self._in_language(prose)
+                visible = prose
             if prose:
                 emit("assistant", text=prose)
                 final = prose

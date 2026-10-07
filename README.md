@@ -98,6 +98,7 @@ Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **작업 �
 
 - `lmw run "요청" -w 폴더` — 대화 없이 8단계로 한 번에 실행 · `--check "pytest -q"` 테스트 통과까지 강제
 - 웹 검색: 기본은 DuckDuckGo·Bing (키 필요 없음). 설정에 `"search_url": "http://localhost:8080"`(SearXNG) 또는 환경변수 `BRAVE_API_KEY` 를 넣으면 그쪽을 먼저 사용
+- 답변 언어: 기본은 **요청이 한글이면 한국어, 아니면 이 컴퓨터의 시스템 언어**. 모델이 영어로 답하면 자동으로 번역해서 보여줍니다. 고정하려면 설정에 `"language": "Korean"` (또는 `en`, `ja`), 환경변수 `LMW_LANG=ko`
 - 검색은 [ripgrep](https://github.com/BurntSushi/ripgrep) 이 있으면 자동 사용 · `/engine aider` 로 [Aider](https://github.com/Aider-AI/aider) 엔진 사용 가능 (`pip install aider-chat`)
 - `lmw export` — 채팅 앱(Open WebUI 등)용 시스템 프롬프트 · `lmw commands` — `/lmw` 슬래시 명령 파일
 - `lmw ssh user@서버` — 다른 컴퓨터에서 실행 · `lmw tunnel user@서버` — 다른 PC의 GPU 모델 사용

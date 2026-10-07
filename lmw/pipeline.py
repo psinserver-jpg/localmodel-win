@@ -114,7 +114,7 @@ class Pipeline:
         self.ws = Workspace(root, backup_dir=self.run_dir / "backup")
         self.ws.touched = list(self.state.get("touched", []))
         self.ws.created = list(self.state.get("created", []))
-        self.lang_rule = language_rule(self.state["request"])
+        self.lang_rule = language_rule(self.state["request"], getattr(cfg, "language", "auto"))
         self.skills = self._pick_skills(self.state["request"])
 
     # =============================================================== helpers
@@ -546,7 +546,13 @@ class Pipeline:
             "checks": Slot(format_findings(findings), 85, 300),
             "file_tree": Slot("\n".join("- " + f for f in files) or "(none)", 95, 10**6),
         }, self.cfg.input_budget())
-        report = self.call("final", prompt)
+        from .textutil import looks_like, preferred_language
+        lang = preferred_language(self.state["request"], getattr(self.cfg, "language", "auto"))
+        report = self.call("final", prompt + "\n\nWrite the whole report in %s (code and file names stay as they are)." % lang)
+        if len(report) > 60 and not looks_like(report, lang):  # the model slipped into English: translate it
+            report = self.call("translate", "Translate this report to %s. Keep code blocks, commands, file names, "
+                               "identifiers and URLs exactly as they are; keep the markdown structure. "
+                               "Output only the translation.\n\n%s" % (lang, report)) or report
         (self.run_dir / "REPORT.md").write_text(report, encoding="utf-8")
         self.state["status"] = "done" if "PASSED" == status_line else "incomplete"
         if self.quiet:

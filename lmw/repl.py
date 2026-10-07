@@ -1300,7 +1300,7 @@ class Shell:
         ws = Workspace(self.root)
         skills = select_skills(load_skills(self.cfg.resolved_skills_dir()), question, self.cfg.skills)
         guide = "\n\n".join(s.body for s in skills if not s.always)
-        system = ASK_SYSTEM % (language_rule(question), ws.tree())
+        system = ASK_SYSTEM % (language_rule(question, self.cfg.language), ws.tree())
         if guide:
             system += "\n# Expert guidance\n" + truncate_to_tokens(guide, self.cfg.input_budget() // 3)
         self.chat.append({"role": "user", "content": question})

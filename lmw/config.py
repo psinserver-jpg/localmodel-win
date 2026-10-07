@@ -37,6 +37,7 @@ class Config:
     terminal: str = "auto"  # auto (Ghostty, else Windows Terminal) | ghostty | wt | none
     permission_mode: str = "ask"  # ask | auto-edit | full
     effort: str = "auto"  # auto | low | medium | high
+    language: str = "auto"  # reply language: auto (the request's script, else this computer's language) | Korean | en | ja …
     interactive: bool = True  # ask the user blocking questions after analysis
     skills: List[str] = field(default_factory=list)  # force-include these skills
     exclude_skills: List[str] = field(default_factory=list)
