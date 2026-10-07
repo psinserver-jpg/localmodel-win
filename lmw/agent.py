@@ -139,6 +139,33 @@ TOOL_DOCS = """- read_file(path, offset=1, limit=400): read a text file; lines a
 - web_fetch(url): read a web page as plain text (use after web_search to read a result, or for a URL the user gave)."""
 
 
+def _fn(name: str, desc: str, props: Dict, required: List[str]) -> Dict:
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": {
+        "type": "object", "properties": props, "required": required}}}
+
+
+_S, _I, _B = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
+TOOL_SCHEMAS = [
+    _fn("read_file", "Read a text file (lines are numbered).", {"path": _S, "offset": _I, "limit": _I}, ["path"]),
+    _fn("write_file", "Create or fully overwrite a file with the COMPLETE content.", {"path": _S, "content": _S}, ["path", "content"]),
+    _fn("edit_file", "Replace exact text in a file (old_string must match exactly and be unique unless replace_all).",
+        {"path": _S, "old_string": _S, "new_string": _S, "replace_all": _B}, ["path", "old_string", "new_string"]),
+    _fn("list_dir", "List files and folders.", {"path": _S}, []),
+    _fn("glob", "Find files by name pattern, e.g. **/*.py", {"pattern": _S}, ["pattern"]),
+    _fn("grep", "Search file contents with a regex.", {"pattern": _S, "path": _S, "glob": _S, "ignore_case": _B}, ["pattern"]),
+    _fn("bash", "Run a shell command in the project folder.", {"command": _S, "timeout": _I}, ["command"]),
+    _fn("web_search", "Search the internet.", {"query": _S, "count": _I}, ["query"]),
+    _fn("web_fetch", "Read a web page as text.", {"url": _S}, ["url"]),
+]
+
+# "I can't create files" / code pasted instead of saved: the model forgot it has tools
+_REFUSAL = re.compile(r"(직접\s*(만들|생성|작성|수정|저장)[^.\n]{0,20}(수\s*(는|가|도)?\s*없|못)|"
+                      r"파일을?\s*(직접\s*)?(만들|생성|저장|수정)[^.\n]{0,15}(수\s*(는|가|도)?\s*없|못)|"
+                      r"접근할\s*수\s*없|can(?:no|')t\s+(create|write|access|modify|edit)|unable to (create|write|access)|"
+                      r"as an ai|i don't have (access|the ability))", re.I)
+_CODE_BLOCK = re.compile(r"```[\w+-]*\n[\s\S]{200,}?```")
+
+
 class Tools:
     def __init__(self, root: Path, check_stop: Callable[[], None]):
         self.ws = Workspace(root)
@@ -437,7 +464,8 @@ def parse_tool_calls(text: str) -> Tuple[List[Dict], str]:
 SYSTEM = """You are LMW, an expert coding agent working directly on the user's computer.
 Project folder: {cwd}   OS: {os}   Date: {date}
 
-You read, search and change files and run commands by calling tools.
+You read, search and change files and run commands by calling tools. You CAN create, edit and delete files and
+run programs on this computer — never say you cannot; do the work with the tools instead of pasting code.
 
 # Calling tools
 Write each tool call exactly like this (valid JSON inside the tags):
@@ -512,6 +540,7 @@ class Agent:
                              tree=tree, skills=skills)
 
     # ------------------------------------------------------- auto-compaction
+    _readonly = False
     COMPACT_AT = 0.8  # summarize older messages when the conversation fills 80% of the context
 
     def _history_tokens(self) -> int:
@@ -629,7 +658,10 @@ class Agent:
                 emit("thinking_live", id=live["id"], text=b.replace("<think>", "").strip())
 
         try:
-            res = self.client.chat(messages, on_token=tap, think=think, **({"refit": True} if refit else {}))
+            extra = {"refit": True, "tools": TOOL_SCHEMAS if not self._readonly else
+                     [t for t in TOOL_SCHEMAS if t["function"]["name"] not in ("write_file", "edit_file", "bash")]} \
+                if refit else {}
+            res = self.client.chat(messages, on_token=tap, think=think, **extra)
         finally:
             progress.done()
         return res.text, res.finish_reason
@@ -649,6 +681,8 @@ class Agent:
         if effort == "auto":
             effort = "medium" if wants_thinking(text, "auto") else "none"
         think = None if effort in ("medium", "high") else False  # simple requests: model's thinking off
+        self._readonly = readonly
+        nudges = 0
         self.history.append({"role": "user", "content": text})
         final = ""
         for step in range(MAX_STEPS):
@@ -672,6 +706,15 @@ class Agent:
                 emit("assistant", text=prose)
                 final = prose
             self.history.append({"role": "assistant", "content": visible or raw})
+            if not calls and not readonly and nudges < 2 and _CODE_TASK.search(text) and \
+                    (_REFUSAL.search(prose or "") or _CODE_BLOCK.search(prose or "")):
+                nudges += 1  # it has tools: make it actually create/edit the files
+                emit("notice", level="info", text="모델이 파일을 직접 만들지 않아 도구로 만들도록 다시 요청합니다")
+                self.history.append({"role": "user", "content": (
+                    "You DO have tools and you are running on the user's computer. Do not explain or paste code — "
+                    "create and change the files yourself now with write_file / edit_file (and run them with bash "
+                    "if useful). Call the tools in this reply.")})
+                continue
             if not calls:
                 if finish == "length" and step < MAX_STEPS - 1:
                     self.history.append({"role": "user", "content": "Your reply was cut off. Continue exactly where you stopped."})

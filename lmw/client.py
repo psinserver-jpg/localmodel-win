@@ -28,6 +28,18 @@ class ModelError(RuntimeError):
     pass
 
 
+def _tool_call_text(tc: Dict) -> str:
+    """A native tool call -> the <tool_call> text format the agent parses."""
+    f = tc.get("function") or tc
+    args = f.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            args = {"_raw": args}
+    return "\n<tool_call>\n%s\n</tool_call>\n" % json.dumps({"name": f.get("name", ""), "arguments": args}, ensure_ascii=False)
+
+
 class ContextRefit(Exception):
     """The model process crashed: the caller should rebuild a smaller prompt and try again."""
 
@@ -123,10 +135,12 @@ class ChatClient:
         on_token: TokenCallback = None,
         think: Optional[bool] = None,
         refit: bool = False,
+        tools: Optional[List[Dict]] = None,
     ) -> ChatResult:
         """think=False asks reasoning models (Qwen3, DeepSeek-R1, …) to answer without thinking.
         refit=True: on a model-process crash raise ContextRefit, so the caller rebuilds a smaller prompt."""
         self._think = think
+        self._tools = tools if getattr(self, "_tools_ok", True) else None
         temperature = self.cfg.temperature if temperature is None else temperature
         max_tokens = max_tokens or self.cfg.max_output_tokens
         last_err: Optional[Exception] = None
@@ -158,6 +172,11 @@ class ChatClient:
                         r"system|role|conversation roles|alternate", detail, re.I):
                     self._merge_system = True  # template has no system role: fold it into the user turn
                     messages = _merge_system_messages(messages)
+                    last_err = e
+                    continue
+                if e.code in (400, 422, 500) and self._tools and re.search(r"tool", detail, re.I):
+                    self._tools_ok = False  # this model/server has no native tool calling: tools stay in the prompt
+                    self._tools = None
                     last_err = e
                     continue
                 if e.code in (400, 422) and getattr(self, "_think_kw", True) and self._think is False:
@@ -376,6 +395,9 @@ class ChatClient:
             body["stream_options"] = {"include_usage": True}
         if getattr(self, "_think", None) is False and getattr(self, "_think_kw", True):
             body["chat_template_kwargs"] = {"enable_thinking": False}  # vLLM / SGLang / llama.cpp (Qwen3 etc.)
+        if getattr(self, "_tools", None):
+            body["tools"] = self._tools
+        calls: Dict[int, Dict] = {}
         think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
@@ -386,6 +408,7 @@ class ChatClient:
                 data = json.loads(resp.read().decode("utf-8"))
                 choice = (data.get("choices") or [{}])[0]
                 text = (choice.get("message") or {}).get("content") or choice.get("text") or ""
+                text += "".join(_tool_call_text(tc) for tc in (choice.get("message") or {}).get("tool_calls") or [])
                 if text and on_token:
                     on_token(text)
                 return ChatResult(text, choice.get("finish_reason") or "stop", data.get("usage"))
@@ -413,9 +436,16 @@ class ChatClient:
                         parts.append(text)
                         if on_token:
                             on_token(text)
+                    for tc in delta.get("tool_calls") or []:  # streamed in pieces: name first, arguments in parts
+                        c = calls.setdefault(int(tc.get("index", len(calls))), {"name": "", "arguments": ""})
+                        f = tc.get("function") or {}
+                        c["name"] += f.get("name") or ""
+                        c["arguments"] += f.get("arguments") or ""
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
         parts += think.close()
+        for i in sorted(calls):
+            parts.append(_tool_call_text({"function": calls[i]}))
         return ChatResult("".join(parts), finish, usage)
 
     def _chat_ollama(self, messages, temperature, max_tokens, on_token) -> ChatResult:
@@ -433,6 +463,8 @@ class ChatClient:
         }
         if getattr(self, "_think", None) is False and getattr(self, "_think_kw", True):
             body["think"] = False  # Ollama >= 0.9: reasoning models answer directly
+        if getattr(self, "_tools", None):
+            body["tools"] = self._tools  # native function calling: much more reliable for tool-trained models
         think = _ThinkMerger()
         parts: List[str] = []
         finish = "stop"
@@ -455,6 +487,8 @@ class ChatClient:
                     parts.append(text)
                     if on_token:
                         on_token(text)
+                for tc in msg.get("tool_calls") or []:
+                    parts.append(_tool_call_text(tc))
                 if chunk.get("done"):
                     finish = chunk.get("done_reason") or "stop"
                     if chunk.get("eval_count"):
