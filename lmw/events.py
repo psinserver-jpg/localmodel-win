@@ -49,6 +49,8 @@ def render_background(e: Event) -> None:
         print(tag + ui.dim("완료 " + str(e.get("stats") or "")))
     elif t == "error":
         print(tag + ui.red(_short(e.get("text"), 80)))
+    elif t == "file":
+        print(tag + ui.dim("파일 받음: " + str(e.get("path"))))
 
 
 class EventBus:
@@ -122,6 +124,14 @@ def diff_preview(diff: str, max_lines: int = 14) -> List[str]:
         rest = len(out) - max_lines
         out = out[:max_lines] + [ui.dim("     … +%d줄" % rest)]
     return out
+
+
+def _size(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    return "%d B" % n if n < 1024 else "%.1f KB" % (n / 1024) if n < 1024 * 1024 else "%.1f MB" % (n / 1048576)
 
 
 def _phase_detail(d: str) -> str:
@@ -205,6 +215,8 @@ def render(e: Event, verbose: bool = False) -> None:
               else ui.dim("  ※ " + text))
     elif t == "error":
         print(ui.red("  ✘ " + str(e.get("text", ""))))
+    elif t == "file":
+        print(ui.dim("  📎 웹에서 받은 파일 저장: %s (%s)" % (e.get("path"), _size(e.get("size")))))
     elif t == "turn_end":
         if e.get("stats"):
             print(ui.dim("\n  " + str(e["stats"])))

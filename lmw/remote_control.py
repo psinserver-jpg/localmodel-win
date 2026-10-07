@@ -561,6 +561,9 @@ class Bridge:
                 if msg.get("kind") == "prompt":
                     ch.inbox.put(("web", str(msg.get("text", ""))))
                     continue
+                if msg.get("kind") == "file":
+                    self._save_upload(ch, msg)
+                    continue
                 action, value = msg.get("action"), msg.get("value", "")
                 if action == "interrupt":
                     ch.on_interrupt()
@@ -570,6 +573,27 @@ class Bridge:
                     ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
                 elif action == "new_session":
                     threading.Thread(target=self.on_new_session, daemon=True).start()
+
+    def _save_upload(self, ch: Channel, msg: Dict) -> None:
+        """A file sent from the website: save it as <project>/uploads/<name> (never overwrites)."""
+        import base64
+        from .events import emit, set_context
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(msg.get("name") or "file")).strip(" .")[:120] or "file"
+        folder = Path(self.cwd) / "uploads"
+        try:
+            data = base64.b64decode(str(msg.get("data") or ""))
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / name
+            stem, suffix, n = target.stem, target.suffix, 2
+            while target.exists():
+                target = folder / ("%s (%d)%s" % (stem, n, suffix))
+                n += 1
+            target.write_bytes(data)
+            set_context(ch.sid if ch.background else "", ch.background)
+            emit("file", name=target.name, path="uploads/" + target.name, size=len(data))
+        except (OSError, ValueError) as e:
+            set_context(ch.sid if ch.background else "", ch.background)
+            emit("notice", level="error", text="파일 저장 실패 (%s): %s" % (name, e))
 
     def _keyboard_loop(self) -> None:
         while not self._stop.is_set():
