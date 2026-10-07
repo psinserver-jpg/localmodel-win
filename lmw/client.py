@@ -28,6 +28,10 @@ class ModelError(RuntimeError):
     pass
 
 
+class _RunnerCrash(Exception):
+    """Ollama's model process stopped (often: out of GPU memory)."""
+
+
 @dataclass
 class ChatResult:
     text: str
@@ -150,6 +154,18 @@ class ChatClient:
                     self._think_kw = False  # server rejected the no-thinking switch; retry without it
                     last_err = e
                     continue
+                if e.code == 500 and self.is_ollama() and self._runner_crashed(detail) and self._num_ctx() > 8192:
+                    self._ctx_cap = max(8192, self._num_ctx() // 2)  # less GPU memory for the KV cache
+                    self._last_detail = detail
+                    try:
+                        from .events import emit
+                        emit("notice", level="warn", text="Ollama 가 모델 실행 중 멈춰서 컨텍스트를 %dK 로 줄여 다시 시도합니다 "
+                             "(GPU 메모리 부족일 가능성이 높습니다)" % (self._ctx_cap // 1024))
+                    except Exception:
+                        pass
+                    last_err = e
+                    time.sleep(1.5)
+                    continue
                 if e.code in (400, 422) and self._stream_usage:
                     self._stream_usage = False  # server rejected stream_options; retry without it
                     last_err = e
@@ -158,6 +174,20 @@ class ChatClient:
                 if e.code < 500:
                     break
                 time.sleep(2 * (attempt + 1))
+            except _RunnerCrash as e:  # the model process died mid-answer
+                STATS.abort()
+                self._last_detail = str(e)
+                if self._num_ctx() > 8192 and attempt < 3:
+                    self._ctx_cap = max(8192, self._num_ctx() // 2)
+                    try:
+                        from .events import emit
+                        emit("notice", level="warn", text="Ollama 가 답하는 중 멈춰서 컨텍스트를 %dK 로 줄여 다시 시도합니다"
+                             % (self._ctx_cap // 1024))
+                    except Exception:
+                        pass
+                    time.sleep(1.5)
+                    continue
+                raise ModelError(self._crash_text(str(e)))
             except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
                 STATS.abort()
                 last_err = e
@@ -196,7 +226,8 @@ class ChatClient:
         """Put a model into GPU memory now, so the first request does not wait. False = not supported."""
         if self.is_ollama():
             self._post_json(self._ollama_base() + "/api/generate",
-                            {"model": name, "prompt": "", "stream": False, "keep_alive": "30m"}, timeout=600)
+                            {"model": name, "prompt": "", "stream": False, "keep_alive": "30m",
+                             "options": {"num_ctx": self._num_ctx()}}, timeout=600)
             return True
         lms = self._lms()
         if lms:
@@ -204,6 +235,23 @@ class ChatClient:
             subprocess.run([lms, "load", name, "-y"], capture_output=True, timeout=600)
             return True
         return False  # vLLM, llama.cpp, …: the server decides what is loaded
+
+    def memory_warning(self, name: str) -> str:
+        """Non-empty when the loaded model does not fully fit in GPU memory (slow, or may crash)."""
+        from . import gpu
+        if not self.is_ollama():
+            return ""
+        try:
+            ps = self._get_json(self._ollama_base() + "/api/ps")
+        except Exception:
+            return ""
+        for m in ps.get("models", []):
+            if m.get("name") == name or m.get("model") == name:
+                size, vram = m.get("size") or 0, m.get("size_vram") or 0
+                if size and vram < size * 0.95:
+                    return ("⚠ GPU 메모리 부족 — %s 의 %d%% 만 GPU 에 올라가 나머지는 CPU 에서 돌아갑니다 (느려지거나 멈출 수 있음). %s"
+                            % (name, int(100 * vram / size), gpu.describe(gpu.usage())))
+        return ""
 
     def unload_model(self, name: str) -> bool:
         """Free the GPU memory of a model that is no longer used."""
@@ -216,6 +264,27 @@ class ChatClient:
             subprocess.run([lms, "unload", name], capture_output=True, timeout=120)
             return True
         return False
+
+    def _crash_text(self, detail: str) -> str:
+        from . import gpu
+        info = gpu.usage()
+        if gpu.low(info) or re.search(r"out of memory|cudaMalloc|OOM", str(detail), re.I):
+            return ("⚠ GPU 메모리 부족 — 모델을 GPU 에 올릴 수 없어 Ollama 가 멈췄습니다.\n  %s\n"
+                    "  해결: GPU 를 쓰는 다른 프로그램을 끄거나, 더 작은 모델(/model) 또는 작은 컨텍스트(/ctx 16384)를 쓰세요."
+                    % (gpu.describe(info) or str(detail).strip()[:200]))
+        return ("Ollama 가 모델을 실행하다 멈췄습니다 (%s). 흔한 원인:\n"
+                "  · GPU 메모리 부족 — 다른 프로그램(vLLM, Open WebUI 의 다른 모델, 게임 등)이 GPU 를 쓰는지 nvidia-smi 로 확인\n"
+                "  · Ollama 가 오래됨 — RTX 50 시리즈는 최신 Ollama 필요 (ollama --version)\n"
+                "  · 컨텍스트가 큼 — /ctx 16384 로 줄여 보기\n"
+                "  같은 GPU 에서 vLLM 이 이미 모델을 띄우고 있다면 /server 로 그 vLLM 을 lmw 에 연결하면 됩니다."
+                % (str(detail).strip()[:200] or "EOF"))
+
+    def _num_ctx(self) -> int:
+        return min(self.cfg.context_tokens, getattr(self, "_ctx_cap", 0) or self.cfg.context_tokens)
+
+    def _runner_crashed(self, detail: str) -> bool:
+        return bool(re.search(r'"?EOF"?|runner process has terminated|out of memory|CUDA error|unexpected server status',
+                              detail or "", re.I))
 
     def _post_json(self, url: str, body: dict, timeout: float = 60) -> dict:
         req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=self._headers())
@@ -316,7 +385,7 @@ class ChatClient:
             "stream": True,
             "options": {
                 "temperature": temperature,
-                "num_ctx": self.cfg.context_tokens,
+                "num_ctx": self._num_ctx(),
                 "num_predict": max_tokens,
             },
             "keep_alive": "30m",  # keep the model in GPU memory between turns (Ollama unloads after 5 min)
@@ -337,6 +406,8 @@ class ChatClient:
                 except ValueError:
                     continue
                 if chunk.get("error"):
+                    if self._runner_crashed(str(chunk["error"])):
+                        raise _RunnerCrash(str(chunk["error"]))
                     raise ModelError(str(chunk["error"]))
                 msg = chunk.get("message") or {}
                 for text in think.feed(msg.get("thinking") or "", msg.get("content") or ""):
@@ -364,6 +435,8 @@ class ChatClient:
             except Exception:
                 pass
             hint = ""
+            if err.code == 500 and self._runner_crashed(detail or getattr(self, "_last_detail", "")):
+                return self._crash_text(detail or getattr(self, "_last_detail", ""))
             if err.code == 404:
                 hint = " (wrong base_url, or model '%s' is not installed/loaded)" % self.cfg.model
             return "Model server returned HTTP %s%s: %s" % (err.code, hint, detail)

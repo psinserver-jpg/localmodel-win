@@ -723,9 +723,19 @@ class Shell:
 
     def _preload(self) -> None:
         try:
-            self.client.load_model(self.cfg.model)
+            if self.client.load_model(self.cfg.model):
+                self._warn_memory(self.cfg.model)
         except Exception:
             pass
+
+    def _warn_memory(self, name: str) -> None:
+        from .events import emit
+        try:
+            msg = self.client.memory_warning(name)
+        except Exception:
+            msg = ""
+        if msg:
+            emit("notice", level="warn", text=msg)
 
     def switch_model(self, old: str, new: str) -> None:
         """Load the newly selected model and unload the previous one (if no other session still uses it)."""
@@ -747,6 +757,7 @@ class Shell:
                 if self.client.load_model(new):
                     emit("notice", level="info", text="모델 준비됨: %s (%.0f초)%s" % (
                         new, time.time() - t0, " · 이전 모델 %s 내림" % old if old and old not in in_use else ""))
+                    self._warn_memory(new)
             except Exception as e:
                 emit("notice", level="warn", text="모델 불러오기 실패: %s" % e)
         threading.Thread(target=run, daemon=True).start()
