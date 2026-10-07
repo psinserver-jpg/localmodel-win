@@ -191,7 +191,7 @@ class Shell:
         _setup_completion()
         _ensure_prompt_toolkit()
         from . import updater
-        updater.check_in_background()
+        updater.check_in_background(self._publish_update)
         self._setup_tui()
         self._banner()
         threading.Thread(target=self._preload, daemon=True).start()  # the first answer doesn't wait for loading
@@ -240,6 +240,8 @@ class Shell:
             self.bridge.on_new_session = self.open_web_session
             self.bridge.main.usage = self.usage
             self._publish_models()
+            from . import __version__, updater
+            self.bridge.set_meta(sid=self.sid, version=__version__, latest=updater.latest or "")
         except Exception as e:
             self.bridge = None
             if not quiet:
@@ -313,6 +315,10 @@ class Shell:
             if line.startswith(CTL_PREFIX):
                 if line[len(CTL_PREFIX):] == "new_session":
                     self.new_session()
+                elif line[len(CTL_PREFIX):] == "update":  # "업데이트" pressed on the website
+                    from .events import emit
+                    emit("notice", level="info", text="웹에서 업데이트를 요청했습니다 — 최신 버전을 설치하고 다시 시작합니다")
+                    self._command("/update")
                 elif line[len(CTL_PREFIX):] == "close_session":  # closed on the website: start a fresh one
                     ui.info(ui.dim("웹에서 이 세션을 닫았습니다 — 새 세션으로 시작합니다 (/continue 로 다시 이어서 할 수 있음)"))
                     self.new_session()
@@ -545,7 +551,12 @@ class Shell:
                 ui.warn("로그인되어 있지 않습니다")
         elif cmd == "/update":
             from . import updater
+            from .events import emit
             if updater.update():
+                emit("notice", level="info", text="업데이트 완료 (v%s) — lmw 를 다시 시작합니다. 잠시 후 새 세션으로 연결됩니다"
+                     % updater._installed_version())
+                for w in self.workers:
+                    w.save_session()
                 ui.info("새 버전으로 다시 시작합니다…")
                 for w in self.workers:
                     w.stop_event.set()
@@ -713,6 +724,12 @@ class Shell:
         decision = decisions[idx]
         emit("permission_result", id=req["id"], decision=decision, by="web" if src == "web" else "terminal")
         return decision
+
+    def _publish_update(self, latest: str) -> None:
+        """Tell the website that this computer can update lmw."""
+        from . import __version__
+        if self.bridge:
+            self.bridge.set_meta(sid=self.sid, version=__version__, latest=latest)
 
     def _publish_models(self) -> None:
         """Tell the website which models this computer's server has (for its model menu)."""

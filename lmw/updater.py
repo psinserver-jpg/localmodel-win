@@ -48,13 +48,18 @@ def remote_version(timeout: float = 5) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def check_in_background() -> None:
-    """Look for a newer version without slowing down startup."""
+def check_in_background(on_found=None) -> None:
+    """Look for a newer version without slowing down startup (on_found(version) when there is one)."""
     def run():
         global latest
         v = remote_version()
         if v and _ver(v) > _ver(__version__):
             latest = v
+            if on_found:
+                try:
+                    on_found(v)
+                except Exception:
+                    pass
     threading.Thread(target=run, daemon=True).start()
 
 

@@ -573,6 +573,8 @@ class Bridge:
                     ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
                 elif action == "new_session":  # value = a closed session to continue (optional)
                     threading.Thread(target=self.on_new_session, args=(str(value or ""),), daemon=True).start()
+                elif action == "update":  # update lmw on this computer (from the website), then restart
+                    self.main.inbox.put(("web", CTL + "update"))
                 elif action == "close_session":
                     ch.inbox.put(("web", CTL + "close_session"))
 

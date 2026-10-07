@@ -4,4 +4,4 @@ A skill pack and orchestrator that keeps local LLMs on track:
 think -> review -> plan -> review -> implement -> review/fix loops -> deliver.
 """
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
