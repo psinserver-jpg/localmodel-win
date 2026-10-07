@@ -606,6 +606,7 @@ class Shell:
         from .stats import bind
         bind(self.usage)  # model calls made for this turn are billed to this session
         self.usage.begin_turn()
+        retry = False
         t0, tin, tout = time.time(), self.usage.prompt_tokens, self.usage.output_tokens
         try:
             if kind == "chat":
@@ -625,6 +626,8 @@ class Shell:
             emit("notice", level="warn", text="중지했습니다")
         except ModelError as e:
             emit("error", text=str(e))
+            if "멈췄습니다" in str(e) or "메모리 부족" in str(e):
+                retry = self._offer_other_server()
         except Exception as e:  # a failing turn must never close lmw
             emit("error", text="%s: %s" % (type(e).__name__, e))
         finally:
@@ -635,7 +638,10 @@ class Shell:
                 pass
             if self.bridge:
                 self.bridge.channel(self.sid).running = False
-            emit("turn_end", stats=turn_stats(t0, tin, tout, self.usage), session=self.usage.line())
+            if not retry:
+                emit("turn_end", stats=turn_stats(t0, tin, tout, self.usage), session=self.usage.line())
+        if retry:  # switched to another model server: run the same request again
+            self.handle(text, route_override, readonly)
 
     def ask_permission(self, req: Dict) -> str:
         """Ask the user (terminal or website) before an important action. Returns allow/always/deny."""
@@ -685,8 +691,9 @@ class Shell:
         lines += diff_preview(str(req.get("diff") or ""), 12)
         if req.get("danger"):
             lines.append(ui.yellow("⚠ 위험할 수 있는 작업입니다"))
-        lines += ["", "계속할까요?" if tool == "bash" else "이 변경을 적용할까요?"]
-        again = "예, 이 세션에서 이 명령은 다시 묻지 않기" if tool == "bash" else "예, 이 세션에서 편집은 다시 묻지 않기"
+        lines += ["", "계속할까요?" if tool in ("bash", "server") else "이 변경을 적용할까요?"]
+        again = "예, 이 세션에서 이 명령은 다시 묻지 않기" if tool == "bash" else \
+            "예, 바꾸고 다시 시도" if tool == "server" else "예, 이 세션에서 편집은 다시 묻지 않기"
         decisions = ["allow", "always", "deny"]
 
         def accept(item):
@@ -1094,6 +1101,39 @@ class Shell:
             self.bridge.model = choice
         ui.ok("model → %s" % choice)
         self._save_choice()
+
+    def _offer_other_server(self) -> bool:
+        """Ollama keeps crashing: if another model server is already running here (e.g. vLLM holding the GPU),
+        offer to switch to it and retry. True = switched."""
+        from .servers import detect
+        from .client import ChatClient
+        cur = self.cfg.base_url.rstrip("/").replace("/v1", "")
+        for srv in detect():
+            if srv.base_url.rstrip("/").replace("/v1", "") == cur or srv.key == "ollama":
+                continue
+            try:
+                models = ChatClient(type(self.cfg)(provider=srv.provider, base_url=srv.base_url)).list_models()
+            except Exception:
+                continue
+            if not models:
+                continue
+            ans = self.ask_permission({
+                "id": "psrv%d" % int(time.time()), "tool": "server", "danger": False,
+                "title": "이 컴퓨터에서 %s 가 이미 모델을 실행 중입니다 — 그 서버로 바꾸고 다시 시도할까요?" % srv.label,
+                "detail": "%s · 모델: %s" % (srv.base_url, ", ".join(models[:3]))})
+            if ans == "deny":
+                return False
+            self.cfg.base_url, self.cfg.provider, self.cfg.model = srv.base_url, srv.provider, models[0]
+            self.client = ChatClient(self.cfg)
+            if self.agent:
+                self.agent.client = self.client
+            if self.bridge:
+                self.bridge.set_meta(sid=self.sid, model=self.cfg.model, models=list(models)[:200])
+                self.bridge.model = self.cfg.model
+            from .events import emit
+            emit("notice", level="info", text="모델 서버를 %s (%s) 로 바꿨습니다 — 다시 시도합니다" % (srv.label, self.cfg.model))
+            return True
+        return False
 
     def _server(self, arg: str) -> None:
         """/server <url> [ollama|openai] — switch model server (e.g. another PC on the LAN)."""

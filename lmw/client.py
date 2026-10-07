@@ -272,7 +272,8 @@ class ChatClient:
             return ("⚠ GPU 메모리 부족 — 모델을 GPU 에 올릴 수 없어 Ollama 가 멈췄습니다.\n  %s\n"
                     "  해결: GPU 를 쓰는 다른 프로그램을 끄거나, 더 작은 모델(/model) 또는 작은 컨텍스트(/ctx 16384)를 쓰세요."
                     % (gpu.describe(info) or str(detail).strip()[:200]))
-        return ("Ollama 가 모델을 실행하다 멈췄습니다 (%s). 흔한 원인:\n"
+        where = gpu.describe(info)
+        return (("현재 GPU — %s\n  " % where if where else "") + "Ollama 가 모델을 실행하다 멈췄습니다 (%s). 흔한 원인:\n"
                 "  · GPU 메모리 부족 — 다른 프로그램(vLLM, Open WebUI 의 다른 모델, 게임 등)이 GPU 를 쓰는지 nvidia-smi 로 확인\n"
                 "  · Ollama 가 오래됨 — RTX 50 시리즈는 최신 Ollama 필요 (ollama --version)\n"
                 "  · 컨텍스트가 큼 — /ctx 16384 로 줄여 보기\n"
