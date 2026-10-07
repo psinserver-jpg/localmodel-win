@@ -62,7 +62,11 @@ class Config:
     statusline: List[str] = field(default_factory=lambda: ["clock", "session", "tokens", "speed", "ttft", "duration"])
 
     def resolved_skills_dir(self) -> Path:
-        return _resolve_dir(self.skills_dir, "skills")
+        try:
+            return _resolve_dir(self.skills_dir, "skills")
+        except FileNotFoundError:  # skills are served by LMW Hub (see hubcontent); none ship in the repository
+            from . import hubcontent
+            return hubcontent.skills_dir()
 
     def resolved_prompts_dir(self) -> Path:
         return _resolve_dir(self.prompts_dir, "prompts")
