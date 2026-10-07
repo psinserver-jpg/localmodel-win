@@ -176,6 +176,57 @@ class ChatClient:
         data = self._get_json(self.cfg.base_url.rstrip("/") + "/models")
         return [m.get("id", "") for m in data.get("data", [])]
 
+    # ----------------------------------------------------- loading / unloading
+    def is_ollama(self) -> bool:
+        if self.cfg.provider == "ollama" or ":11434" in self.cfg.base_url:
+            return True
+        if not hasattr(self, "_ollama_probe"):
+            try:
+                self._get_json(self._ollama_base() + "/api/version")
+                self._ollama_probe = True
+            except Exception:
+                self._ollama_probe = False
+        return self._ollama_probe
+
+    def _lms(self) -> Optional[str]:
+        import shutil
+        return shutil.which("lms") if ":1234" in self.cfg.base_url else None
+
+    def load_model(self, name: str) -> bool:
+        """Put a model into GPU memory now, so the first request does not wait. False = not supported."""
+        if self.is_ollama():
+            self._post_json(self._ollama_base() + "/api/generate",
+                            {"model": name, "prompt": "", "stream": False, "keep_alive": "30m"}, timeout=600)
+            return True
+        lms = self._lms()
+        if lms:
+            import subprocess
+            subprocess.run([lms, "load", name, "-y"], capture_output=True, timeout=600)
+            return True
+        return False  # vLLM, llama.cpp, …: the server decides what is loaded
+
+    def unload_model(self, name: str) -> bool:
+        """Free the GPU memory of a model that is no longer used."""
+        if self.is_ollama():
+            self._post_json(self._ollama_base() + "/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+            return True
+        lms = self._lms()
+        if lms:
+            import subprocess
+            subprocess.run([lms, "unload", name], capture_output=True, timeout=120)
+            return True
+        return False
+
+    def _post_json(self, url: str, body: dict, timeout: float = 60) -> dict:
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            raise ModelError("HTTP %s: %s" % (e.code, _peek(e)))
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            raise ModelError(self._explain(e))
+
     # --------------------------------------------------------------- internals
     def _headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}

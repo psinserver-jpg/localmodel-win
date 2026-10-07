@@ -191,6 +191,7 @@ class Shell:
         updater.check_in_background()
         self._setup_tui()
         self._banner()
+        threading.Thread(target=self._preload, daemon=True).start()  # the first answer doesn't wait for loading
         self.connect_hub()
         from . import tui
         if not tui.available():
@@ -696,11 +697,47 @@ class Shell:
                     self.bridge.set_meta(sid=w.sid, models=self._models)
         threading.Thread(target=run, daemon=True).start()
 
+    def _all_shells(self) -> List["Shell"]:
+        main = self.main_shell if getattr(self, "main_shell", None) else self
+        return [main] + list(main.workers)
+
+    def _preload(self) -> None:
+        try:
+            self.client.load_model(self.cfg.model)
+        except Exception:
+            pass
+
+    def switch_model(self, old: str, new: str) -> None:
+        """Load the newly selected model and unload the previous one (if no other session still uses it)."""
+        from .events import emit
+        if old == new:
+            return
+        in_use = {s.cfg.model for s in self._all_shells()}
+
+        sid, bg = self.sid or "", self.background
+
+        def run():
+            from .events import set_context
+            set_context(sid, bg)  # notices go to the session that switched
+            t0 = time.time()
+            try:
+                if old and old not in in_use:
+                    self.client.unload_model(old)
+                emit("notice", level="info", text="모델 불러오는 중: %s" % new)
+                if self.client.load_model(new):
+                    emit("notice", level="info", text="모델 준비됨: %s (%.0f초)%s" % (
+                        new, time.time() - t0, " · 이전 모델 %s 내림" % old if old and old not in in_use else ""))
+            except Exception as e:
+                emit("notice", level="warn", text="모델 불러오기 실패: %s" % e)
+        threading.Thread(target=run, daemon=True).start()
+
     def _remote_control(self, action: str, value: str) -> None:
         from .events import emit
         if action == "model" and value.strip():
             name = value.strip()
+            old = self.cfg.model
             self.cfg.model = name  # next model call uses it; the conversation is kept
+            self.switch_model(old, name)
             if self.bridge:
                 self.bridge.set_meta(sid=self.sid, model=name)
                 if not self.background:
@@ -751,6 +788,7 @@ class Shell:
         w.bridge, w.sid, w.background = self.bridge, ch.sid, True
         w.client = copy.copy(self.client)  # same server settings, but this session's own model
         w.client.cfg = w.cfg
+        w.main_shell = self
         ch.usage = w.usage  # its own token/time totals
         w.perms.mode, w.effort, w.engine = self.perms.mode, self.effort, self.engine
         w.read = lambda prompt="": Bridge.read_channel(ch, prompt)
@@ -923,7 +961,9 @@ class Shell:
         if not ans:
             return
         choice = models[int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(models) else ans
+        old = self.cfg.model
         self.cfg.model = choice
+        self.switch_model(old, choice)
         if self.bridge:
             self.bridge.set_meta(sid=self.sid, model=choice)
             self.bridge.model = choice
