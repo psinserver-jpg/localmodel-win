@@ -42,7 +42,7 @@ lmw
 
 ## 3. 쓰는 법
 
-그냥 말하듯 입력하면 됩니다. lmw 가 알아서 파일을 **찾고(Grep·Glob) → 읽고(Read) → 고치고(Edit·Write) → 실행해서 확인(Bash)** 합니다.
+그냥 말하듯 입력하면 됩니다. lmw 가 알아서 파일을 **찾고(Grep·Glob) → 읽고(Read) → 고치고(Edit·Write) → 실행해서 확인(Bash)** 하고, 필요하면 **웹 검색(WebSearch)·페이지 읽기(WebFetch)** 도 합니다.
 
 ```
 > calc.py 의 add 버그 고쳐줘
@@ -95,6 +95,7 @@ Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **Shift+Ta
 <summary>고급 기능</summary>
 
 - `lmw run "요청" -w 폴더` — 대화 없이 8단계로 한 번에 실행 · `--check "pytest -q"` 테스트 통과까지 강제
+- 웹 검색: 기본은 DuckDuckGo·Bing (키 필요 없음). 설정에 `"search_url": "http://localhost:8080"`(SearXNG) 또는 환경변수 `BRAVE_API_KEY` 를 넣으면 그쪽을 먼저 사용
 - 검색은 [ripgrep](https://github.com/BurntSushi/ripgrep) 이 있으면 자동 사용 · `/engine aider` 로 [Aider](https://github.com/Aider-AI/aider) 엔진 사용 가능 (`pip install aider-chat`)
 - `lmw export` — 채팅 앱(Open WebUI 등)용 시스템 프롬프트 · `lmw commands` — `/lmw` 슬래시 명령 파일
 - `lmw ssh user@서버` — 다른 컴퓨터에서 실행 · `lmw tunnel user@서버` — 다른 PC의 GPU 모델 사용

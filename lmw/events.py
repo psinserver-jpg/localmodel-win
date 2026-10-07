@@ -21,7 +21,7 @@ Sink = Callable[[Event], None]
 
 TOOL_LABELS = {
     "read_file": "Read", "write_file": "Write", "edit_file": "Edit", "list_dir": "List",
-    "glob": "Glob", "grep": "Grep", "bash": "Bash",
+    "glob": "Glob", "grep": "Grep", "bash": "Bash", "web_search": "WebSearch", "web_fetch": "WebFetch",
 }
 
 

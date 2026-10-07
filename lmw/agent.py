@@ -53,6 +53,7 @@ _SMALLTALK = re.compile(
     r"good (morning|night)|ok|okay|ㅇㅋ|오케이|넵|네|응|ㅋ+|ㅎ+)[\s!.?~ㅎㅋ^]*$", re.I)
 _TECH = re.compile(r"(파일|폴더|코드|함수|클래스|프로젝트|에러|오류|버그|만들|고쳐|수정|실행|설치|빌드|테스트|배포|"
                    r"요약|읽어|보여|찾아|열어|분석|설명해|readme|summar|"
+                   r"검색|찾아봐|알아봐|뉴스|최신|요즘|오늘|날씨|가격|주가|환율|버전|search|latest|news|price|weather|https?://|www\.|"
                    r"file|code|error|bug|build|run|fix|install|test|deploy|\.\w{1,5}\b|/|\\)", re.I)
 _BUILD_VERB = re.compile(r"(만들어|만들자|제작|개발해|구현해|짜줘|build|create|make|develop)", re.I)
 _BUILD_NOUN = re.compile(r"(웹사이트|홈페이지|사이트|웹앱|앱|어플|게임|랜딩|대시보드|쇼핑몰|포트폴리오|프로젝트|서비스|"
@@ -108,7 +109,7 @@ class Permissions:
 
     def needs_ask(self, tool: str, args: Dict) -> Tuple[bool, bool]:
         """(ask?, dangerous?)"""
-        if tool in ("read_file", "list_dir", "glob", "grep"):
+        if tool in ("read_file", "list_dir", "glob", "grep", "web_search", "web_fetch"):
             return False, False
         if tool in ("write_file", "edit_file"):
             return (self.mode == "ask" and "edit" not in self.always), False
@@ -133,7 +134,9 @@ TOOL_DOCS = """- read_file(path, offset=1, limit=400): read a text file; lines a
 - list_dir(path="."): list files and folders.
 - glob(pattern): find files by name, e.g. "**/*.py", "src/**/*.css".
 - grep(pattern, path=".", glob=null, ignore_case=false): search file contents with a regex; returns file:line: text.
-- bash(command, timeout=120): run a shell command in the project folder (%s). Use for tests, builds, git, package managers."""
+- bash(command, timeout=120): run a shell command in the project folder (%s). Use for tests, builds, git, package managers.
+- web_search(query, count=8): search the internet; returns titles, URLs and snippets. Use for current information, news, prices, docs, error messages, library versions — anything you are not sure about or that may have changed.
+- web_fetch(url): read a web page as plain text (use after web_search to read a result, or for a URL the user gave)."""
 
 
 class Tools:
@@ -306,6 +309,27 @@ class Tools:
         text = _clip("".join(out))
         return proc.returncode == 0, "exit %d" % proc.returncode, text or "(no output)", {}
 
+    searxng = ""  # optional SearXNG URL from the config
+
+    def web_search(self, query: str = "", count: int = 8, **_):
+        from . import web
+        if not str(query).strip():
+            return False, "검색어 없음", "query must not be empty", {}
+        res = web.search(str(query), count, self.searxng)
+        if not res:
+            return True, "결과 없음", "No results.", {}
+        out = "\n\n".join("%d. %s\n   %s\n   %s" % (i, r["title"], r["url"], r["snippet"][:300])
+                           for i, r in enumerate(res, 1))
+        return True, "%d개 결과" % len(res), out, {"results": res[:8]}
+
+    def web_fetch(self, url: str = "", **_):
+        from . import web
+        if not str(url).strip():
+            return False, "URL 없음", "url must not be empty", {}
+        page = web.fetch_text(str(url))
+        return True, "%s (%d자)" % ((page["title"] or page["url"])[:60], len(page["text"])), \
+            "# %s\n%s\n\n%s" % (page["title"], page["url"], page["text"]), {}
+
     def run(self, name: str, args: Dict):
         fn = getattr(self, name, None) if name in TOOL_LABELS else None
         if fn is None:
@@ -335,6 +359,10 @@ def tool_title(name: str, args: Dict) -> str:
     label = TOOL_LABELS.get(name, name)
     if name == "bash":
         arg = str(args.get("command", ""))
+    elif name == "web_search":
+        arg = str(args.get("query", ""))
+    elif name == "web_fetch":
+        arg = str(args.get("url", ""))
     elif name in ("glob", "grep"):
         arg = str(args.get("pattern", ""))
         if name == "grep" and args.get("path") not in (None, "", "."):
@@ -458,6 +486,7 @@ class Agent:
         self.perms = perms
         self.stop = stop
         self.tools = Tools(self.root, self.check_stop)
+        self.tools.searxng = getattr(cfg, "search_url", "")
         self.history: List[Dict[str, str]] = []
         self._skills = load_skills(cfg.resolved_skills_dir())
 

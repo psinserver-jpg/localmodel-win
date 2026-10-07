@@ -47,6 +47,9 @@ class Config:
     skills_dir: str = ""
     prompts_dir: str = ""
 
+    # Web search: optional SearXNG URL (else Brave with BRAVE_API_KEY, else DuckDuckGo)
+    search_url: str = ""
+
     # Output
     verbose: bool = False  # stream model text to the console
     # remote control (relay runs on this computer when remote control turns on)
