@@ -412,6 +412,7 @@ class Bridge:
         self._stop = threading.Event()
         self._started = False
         self._pending_line = ""
+        self._seen_errors: set = set()
         self.mirror_terminal = False
         self.tui = False  # set by start(): prompt_toolkit input box instead of the keyboard thread
         self.on_new_session: Callable[[], None] = lambda: None  # set by the shell
@@ -545,38 +546,63 @@ class Bridge:
 
     def _flush_loop(self) -> None:
         while not self._stop.wait(0.4):
-            self.flush()
+            try:
+                self.flush()
+            except Exception as e:  # sending to the site must never stop for good because of one bad moment
+                self._loop_error("전송", e)
+
+    def _loop_error(self, what: str, e: BaseException) -> None:
+        """A background loop hit an unexpected error: say so once per kind of error, keep running."""
+        key = (what, type(e).__name__, str(e)[:80])
+        if key in self._seen_errors:
+            return
+        self._seen_errors.add(key)
+        with ui.remote_muted():
+            print(ui.dim("  ⇢ 웹 연결 %s 중 오류 (계속 시도합니다): %s: %s" % (what, type(e).__name__, str(e)[:120])))
 
     # -------------------------------------------------------------- input
     def _input_loop(self, ch: Channel) -> None:
+        """Receive what the website sends. This loop must never end by accident: if it did, lmw would stop
+        taking prompts while the site (fed by the other loop) still looked fine."""
         while not self._stop.is_set() and not ch.closed:
             try:
                 _, d = _req("GET", "%s/api/sessions/%s/input" % (self.relay, ch.sid), token=self.token, timeout=35)
-            except (urllib.error.URLError, OSError):
+                msgs = d.get("input") or []
+            except (urllib.error.URLError, OSError, ValueError, AttributeError):  # offline, hub restarting, odd reply
                 self._stop.wait(3)
                 continue
-            for msg in d.get("input") or []:
-                if isinstance(msg, str):  # older hubs
-                    msg = {"kind": "prompt", "text": msg}
-                if msg.get("kind") == "prompt":
-                    ch.inbox.put(("web", str(msg.get("text", ""))))
-                    continue
-                if msg.get("kind") == "file":
-                    self._save_upload(ch, msg)
-                    continue
-                action, value = msg.get("action"), msg.get("value", "")
-                if action == "interrupt":
-                    ch.on_interrupt()
-                elif action in ("mode", "effort", "model"):
-                    ch.on_control(action, value)
-                elif action == "permission":
-                    ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
-                elif action == "new_session":  # value = a closed session to continue (optional)
-                    threading.Thread(target=self.on_new_session, args=(str(value or ""),), daemon=True).start()
-                elif action == "update":  # update lmw on this computer (from the website), then restart
-                    self.main.inbox.put(("web", CTL + "update"))
-                elif action == "close_session":
-                    ch.inbox.put(("web", CTL + "close_session"))
+            except Exception as e:
+                self._loop_error("수신", e)
+                self._stop.wait(3)
+                continue
+            for msg in msgs:  # these are already gone from the hub: one failing must not drop the rest
+                try:
+                    self._handle_web_message(ch, msg)
+                except Exception as e:
+                    self._loop_error("메시지 처리", e)
+
+    def _handle_web_message(self, ch: Channel, msg) -> None:
+        if isinstance(msg, str):  # older hubs
+            msg = {"kind": "prompt", "text": msg}
+        if msg.get("kind") == "prompt":
+            ch.inbox.put(("web", str(msg.get("text", ""))))
+            return
+        if msg.get("kind") == "file":
+            self._save_upload(ch, msg)
+            return
+        action, value = msg.get("action"), msg.get("value", "")
+        if action == "interrupt":
+            ch.on_interrupt()
+        elif action in ("mode", "effort", "model"):
+            ch.on_control(action, value)
+        elif action == "permission":
+            ch.inbox.put(("web", PERM + "%s:%s" % (msg.get("id", ""), value)))
+        elif action == "new_session":  # value = a closed session to continue (optional)
+            threading.Thread(target=self.on_new_session, args=(str(value or ""),), daemon=True).start()
+        elif action == "update":  # update lmw on this computer (from the website), then restart
+            self.main.inbox.put(("web", CTL + "update"))
+        elif action == "close_session":
+            ch.inbox.put(("web", CTL + "close_session"))
 
     def _save_upload(self, ch: Channel, msg: Dict) -> None:
         """A file sent from the website: save it as <project>/uploads/<name> (never overwrites)."""
