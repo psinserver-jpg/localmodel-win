@@ -163,7 +163,30 @@ _REFUSAL = re.compile(r"(직접\s*(만들|생성|작성|수정|저장)[^.\n]{0,2
                       r"파일을?\s*(직접\s*)?(만들|생성|저장|수정)[^.\n]{0,15}(수\s*(는|가|도)?\s*없|못)|"
                       r"접근할\s*수\s*없|can(?:no|')t\s+(create|write|access|modify|edit)|unable to (create|write|access)|"
                       r"as an ai|i don't have (access|the ability))", re.I)
+# "would you like to try…", "run this yourself" — the agent should do it, not the user
+_HANDBACK = re.compile(r"(시도해\s*보시겠|해\s*보시겠습니까|실행해\s*보세요|직접\s*(실행|입력|수정|변경|확인)해\s*(보세요|주세요)|"
+                       r"다음과\s*같이\s*(변경|수정|실행)|해\s*보시기\s*바랍|사용할\s*수\s*있습니다\.?\s*$|"
+                       r"would you like (me )?to|you can (run|try|use)|try (running|the following)|please run)", re.I | re.M)
 _CODE_BLOCK = re.compile(r"```[\w+-]*\n[\s\S]{200,}?```")
+
+
+def windows_shell() -> Tuple[List[str], str]:
+    """(argv prefix, name) of the shell used for the bash tool on Windows."""
+    for c in (os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
+              os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "bin", "bash.exe")):
+        if c and os.path.isfile(c):
+            return [c, "-lc"], "bash (Git Bash: grep, ls, cat, rm, … work)"
+    ps = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+    return [ps, "-NoProfile", "-NonInteractive", "-Command"], \
+        "PowerShell (no grep/cat/rm -rf: use Select-String, Get-Content, Remove-Item, or the grep/glob/read_file tools)"
+
+
+def shell_name() -> str:
+    return windows_shell()[1] if os.name == "nt" else "sh"
+
+
+_WIN_HINT = ("\n[hint] This is Windows. Use the grep / glob / read_file / list_dir tools for searching and reading, "
+             "and PowerShell syntax for commands (Select-String, Get-ChildItem, Get-Content). Fix the command and continue.")
 
 
 class Tools:
@@ -313,8 +336,13 @@ class Tools:
             return False, "명령 없음", "empty command", {}
         timeout = max(1, min(int(timeout or 120), 1800))
         try:
-            proc = subprocess.Popen(command, shell=True, cwd=str(self.root), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            if os.name == "nt":
+                argv = windows_shell()[0] + [command]
+                proc = subprocess.Popen(argv, cwd=str(self.root), stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            else:
+                proc = subprocess.Popen(command, shell=True, cwd=str(self.root), stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         except OSError as e:
             return False, "실행 실패", str(e), {}
         out: List[str] = []
@@ -334,6 +362,9 @@ class Tools:
             time.sleep(0.1)
         reader.join(5)
         text = _clip("".join(out))
+        if proc.returncode != 0 and os.name == "nt" and re.search(
+                r"not recognized|인식되지|CommandNotFound|command not found|is not recognized", text, re.I):
+            text += _WIN_HINT  # e.g. grep in cmd: tell the model how to do it here instead of giving up
         return proc.returncode == 0, "exit %d" % proc.returncode, text or "(no output)", {}
 
     searxng = ""  # optional SearXNG URL from the config
@@ -481,7 +512,9 @@ When the work is finished, or for conversation, reply WITHOUT any tool call.
 # How to work
 - Understand first: search (grep/glob) and read the relevant files before changing anything. Never guess file contents.
 - Small change: edit_file with an exact, unique old_string. New file or full rewrite: write_file with the complete content. No placeholders like "..." or "rest of code".
-- Keep the user's request as the goal; do exactly what was asked, completely.
+- Keep the user's request as the goal; do exactly what was asked, completely. Finish it yourself: never end by asking
+  the user to run commands, try something or make changes — you run, check and fix things with the tools.
+- When a command fails, find out why and try another way (other command, the grep/glob/read_file tools) — don't give up.
 - Verify: run the project's tests/build/linter when they exist, or re-read what you changed. Fix failures before finishing.
 - The user is asked automatically before edits and commands; never ask in text for permission to proceed.
 - Only tell the user things that matter (a decision, a problem, a question you cannot answer yourself). No running commentary.
@@ -531,7 +564,7 @@ class Agent:
             budget = max(600, self._budget() // 6)
             body = "\n\n".join("## %s\n%s" % (s.name, s.body) for s in picked)
             skills = "\n# Expert guidance\n" + truncate_to_tokens(body, budget)
-        tools = TOOL_DOCS % ("cmd.exe" if os.name == "nt" else "sh")
+        tools = TOOL_DOCS % shell_name()
         if readonly:
             tools = "\n".join(l for l in tools.splitlines() if not l.startswith(("- write_file", "- edit_file", "- bash")))
         return SYSTEM.format(cwd=self.root, os="%s %s" % (platform.system(), platform.release()),
@@ -706,14 +739,15 @@ class Agent:
                 emit("assistant", text=prose)
                 final = prose
             self.history.append({"role": "assistant", "content": visible or raw})
-            if not calls and not readonly and nudges < 2 and _CODE_TASK.search(text) and \
-                    (_REFUSAL.search(prose or "") or _CODE_BLOCK.search(prose or "")):
-                nudges += 1  # it has tools: make it actually create/edit the files
-                emit("notice", level="info", text="모델이 파일을 직접 만들지 않아 도구로 만들도록 다시 요청합니다")
+            if not calls and not readonly and nudges < 3 and (step > 0 or _CODE_TASK.search(text)) and \
+                    (_REFUSAL.search(prose or "") or _CODE_BLOCK.search(prose or "") or _HANDBACK.search(prose or "")):
+                nudges += 1  # it has tools: make it do the work itself, to the end
+                emit("notice", level="info", text="작업을 사용자에게 넘기지 않고 끝까지 직접 하도록 다시 요청합니다 (%d/3)" % nudges)
                 self.history.append({"role": "user", "content": (
-                    "You DO have tools and you are running on the user's computer. Do not explain or paste code — "
-                    "create and change the files yourself now with write_file / edit_file (and run them with bash "
-                    "if useful). Call the tools in this reply.")})
+                    "Do not hand the work back to me and do not ask me to run or change anything. You have tools on "
+                    "this computer: do it yourself now — create/edit files with write_file / edit_file, run and check "
+                    "with bash (fix failing commands, e.g. use the grep/glob tools or PowerShell on Windows). Continue "
+                    "until my original request is fully done:\n" + text[:1500])})
                 continue
             if not calls:
                 if finish == "length" and step < MAX_STEPS - 1:
