@@ -199,6 +199,8 @@ class Shell:
         _ensure_prompt_toolkit()
         from . import updater
         updater.check_in_background(self._publish_update)
+        from . import hubcontent
+        hubcontent.sync_in_background(wait_first=8)  # skills/agents come from psin.ai.kr
         self._setup_tui()
         self._banner()
         threading.Thread(target=self._preload, daemon=True).start()  # the first answer doesn't wait for loading

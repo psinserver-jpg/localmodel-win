@@ -65,7 +65,8 @@ def parse_persona(text: str, fallback: str) -> Optional[Persona]:
 
 def load_agents() -> Dict[str, Persona]:
     out: Dict[str, Persona] = {}
-    for d in (builtin_agents_dir(), user_agents_dir()):
+    from . import hubcontent
+    for d in (builtin_agents_dir(), hubcontent.agents_dir(), user_agents_dir()):
         if not d.is_dir():
             continue
         for f in sorted(d.glob("*.md")):

@@ -88,7 +88,7 @@ Claude Code 처럼 입력 박스(`/` 입력 시 명령 자동완성), **작업 �
 
 ## 도구 · 스킬 · 에이전트 · MCP
 
-모델이 꺼내 쓰는 내장 도구(폴더/이동/복사/삭제, 여러 파일 읽기, tree, calc, python, serve, download, git, todo, remember/recall, ask_user …)와 하위 에이전트(`agents/`), 디자인·three.js 스킬(`skills/`)이 기본으로 들어 있습니다.
+모델이 꺼내 쓰는 내장 도구(폴더/이동/복사/삭제, 여러 파일 읽기, tree, calc, python, serve, download, git, todo, remember/recall, ask_user …)가 들어 있습니다. 하위 에이전트와 디자인·three.js 스킬은 저장소가 아니라 **LMW Hub(psin.ai.kr)에서 받아옵니다** — lmw 를 켤 때 자동으로(6시간마다), 또는 `lmw sync` 로 바로 받습니다. 오프라인이면 마지막으로 받은 것을 씁니다.
 
 | 명령 | 설명 |
 |---|---|

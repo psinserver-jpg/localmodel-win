@@ -162,6 +162,11 @@ def all_skills(builtin_dir: Path) -> List[Skill]:
     """The skills that ship with lmw plus the ones installed by the user (built-in names win)."""
     skills = load_skills(builtin_dir)
     have = {s.name.lower() for s in skills}
+    from . import hubcontent  # skills served by LMW Hub count as built-in (not library)
+    for s in load_skills(hubcontent.skills_dir()):
+        if s.name.lower() not in have:
+            skills.append(s)
+            have.add(s.name.lower())
     for s in load_skills(user_skills_dir()):
         if s.name.lower() not in have:
             s.library = True  # anything installed from outside is a library skill

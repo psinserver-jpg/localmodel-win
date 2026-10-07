@@ -137,6 +137,17 @@ def cmd_tools(args) -> int:
     return 0
 
 
+def cmd_sync(args) -> int:
+    from . import hubcontent
+    try:
+        r = hubcontent.sync(force=True, log=ui.warn)
+    except Exception as e:
+        ui.warn("허브에서 받지 못했습니다 (%s). 이전에 받은 것은 그대로 쓸 수 있습니다." % e)
+        return 1
+    ui.ok("허브 스킬·에이전트 %d개 파일 (새로 %d, 삭제 %d) → %s" % (r["total"], r["downloaded"], r["removed"], hubcontent.home()))
+    return 0
+
+
 def cmd_skills(args) -> int:
     from . import skillhub
     words = list(args.text or [])
@@ -388,6 +399,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser("update", help="update lmw to the latest version")
     up.set_defaults(func=lambda a: 0 if __import__("lmw.updater", fromlist=["update"]).update() else 1)
+
+    sy = sub.add_parser("sync", help="download the latest skills and sub-agents from LMW Hub (psin.ai.kr)")
+    sy.set_defaults(func=cmd_sync)
 
     wt = sub.add_parser("watch", help="show the live lmw screen of another computer on your account")
     wt.set_defaults(func=cmd_watch)

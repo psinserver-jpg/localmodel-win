@@ -25,7 +25,7 @@ from . import __version__, ui
 REPO = "psinserver-jpg/localmodel-win"
 BRANCH = os.environ.get("LMW_BRANCH", "main")
 APP = Path(__file__).resolve().parent.parent  # the install folder (contains lmw/, skills/, prompts/)
-PARTS = ("lmw", "skills", "agents", "prompts", "README.md", "LICENSE", "install.ps1", "install.sh")
+PARTS = ("lmw", "skills", "prompts", "README.md", "LICENSE", "install.ps1", "install.sh")
 
 latest: Optional[str] = None  # filled in by check_in_background()
 
