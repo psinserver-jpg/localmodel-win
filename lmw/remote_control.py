@@ -616,7 +616,7 @@ class Bridge:
                 ch.prompt = "lmw ❯"
                 try:
                     source, text = tui.input_box(ui.TUI["commands"], ui.TUI["hints"], ui.TUI["shift_tab"],
-                                                 external=ch.inbox)
+                                                 external=ch.inbox, default=ui.TUI.pop("prefill", "") or "")
                 finally:
                     ch.prompt = ""
                 if source == "eof":

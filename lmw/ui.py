@@ -212,6 +212,12 @@ class Progress:
             verb = "작성 중…"
         g = self.GLYPHS[self._n % len(self.GLYPHS)]
         line = "%s %s (%ds · ↓ %s 토큰 · Ctrl+C 로 중지)" % (g, verb, secs, fmt_tokens(toks))
+        from . import keys
+        k = keys.KEYS
+        if k is not None:  # what the user is typing meanwhile (Enter adds it to this request)
+            room = max(10, _width() - 4 - dwidth(line))
+            typed = k.buf[-room:] if k.buf else ""
+            line += ("  ❯ " + typed) if typed else "  · 입력하면 작업에 추가됩니다"
         head, rest = g + " " + verb, line[len(g) + 1 + len(verb):]
         pad = " " * max(0, _width() - 2 - dwidth(line))
         with self._lock:
@@ -262,6 +268,12 @@ TUI = {"commands": [], "hints": lambda: [], "shift_tab": None, "choose_active": 
 
 def read_line(prompt: str = "", main: bool = False) -> str:
     """main=True: the big input box (lmw ❯). Otherwise a one-line question."""
+    from . import keys
+    with keys.paused():  # typing-while-working pauses while a question owns the keyboard
+        return _read_line(prompt, main)
+
+
+def _read_line(prompt: str = "", main: bool = False) -> str:
     if _input_hook is not None:
         try:
             return _input_hook(prompt, main)
@@ -270,7 +282,7 @@ def read_line(prompt: str = "", main: bool = False) -> str:
     if main:
         from . import tui
         if tui.available():
-            return tui.input_box(TUI["commands"], TUI["hints"], TUI["shift_tab"])[1]
+            return tui.input_box(TUI["commands"], TUI["hints"], TUI["shift_tab"], default=TUI.pop("prefill", "") or "")[1]
     return input(prompt)
 
 

@@ -167,6 +167,11 @@ _REFUSAL = re.compile(r"(직접\s*(만들|생성|작성|수정|저장)[^.\n]{0,2
 _HANDBACK = re.compile(r"(시도해\s*보시겠|해\s*보시겠습니까|실행해\s*보세요|직접\s*(실행|입력|수정|변경|확인)해\s*(보세요|주세요)|"
                        r"다음과\s*같이\s*(변경|수정|실행)|해\s*보시기\s*바랍|사용할\s*수\s*있습니다\.?\s*$|"
                        r"would you like (me )?to|you can (run|try|use)|try (running|the following)|please run)", re.I | re.M)
+# "I'll now create…" with no tool call: it announced the next step but stopped
+_INTENT = re.compile(r"(하겠습니다|해\s*보겠습니다|진행하겠|시작하겠|만들겠|작성하겠|생성하겠|설정하겠|확인하겠|"
+                     r"\b(let me|i will|i'll|next,? i|now i('ll| will)|let's)\b)", re.I)
+# requests that are only done when files exist
+_MAKE = re.compile(r"(만들어|만들자|생성해|작성해|구현해|짜줘|추가해|수정해|고쳐|바꿔|create|build|make|write|implement|add|fix)", re.I)
 _CODE_BLOCK = re.compile(r"```[\w+-]*\n[\s\S]{200,}?```")
 
 
@@ -584,6 +589,19 @@ class Agent:
         pb = getattr(self.client, "prompt_budget", None)
         return min(self.cfg.input_budget(), pb()) if callable(pb) else self.cfg.input_budget()
 
+    interject = None  # set by the shell: () -> [lines the user added while this request runs]
+
+    def _interjections(self) -> List[str]:
+        try:
+            return list(self.interject() or []) if self.interject else []
+        except Exception:
+            return []
+
+    def _add_interjection(self, t: str) -> None:
+        emit("user", text=t, interject=True)
+        self.history.append({"role": "user", "content": "[The user added while you were working — handle this too, "
+                                                        "in order, after what you were doing]\n" + t})
+
     def maybe_compact(self, system: str) -> None:
         budget = self._budget() - estimate_tokens(system)
         if self._history_tokens() > self.COMPACT_AT * budget and len(self.history) > 4:
@@ -716,6 +734,9 @@ class Agent:
         think = None if effort in ("medium", "high") else False  # simple requests: model's thinking off
         self._readonly = readonly
         nudges = 0
+        self._wrote = 0  # files created/changed in this request
+        for t in self._interjections():  # typed before the first step: part of the request
+            self._add_interjection(t)
         self.history.append({"role": "user", "content": text})
         final = ""
         for step in range(MAX_STEPS):
@@ -739,10 +760,19 @@ class Agent:
                 emit("assistant", text=prose)
                 final = prose
             self.history.append({"role": "assistant", "content": visible or raw})
-            if not calls and not readonly and nudges < 3 and (step > 0 or _CODE_TASK.search(text)) and \
-                    (_REFUSAL.search(prose or "") or _CODE_BLOCK.search(prose or "") or _HANDBACK.search(prose or "")):
+            if not calls:  # about to stop: first handle anything the user added meanwhile, in order
+                added = self._interjections()
+                if added:
+                    for t in added:
+                        self._add_interjection(t)
+                    continue
+            unfinished = bool(_MAKE.search(text)) and self._wrote == 0  # asked to make/change files, none touched yet
+            tail = (prose or "").strip()[-300:]
+            if not calls and not readonly and nudges < 3 and finish != "length" and (step > 0 or _CODE_TASK.search(text)) and \
+                    (_REFUSAL.search(prose or "") or _CODE_BLOCK.search(prose or "") or _HANDBACK.search(prose or "")
+                     or _INTENT.search(tail) or unfinished):
                 nudges += 1  # it has tools: make it do the work itself, to the end
-                emit("notice", level="info", text="작업을 사용자에게 넘기지 않고 끝까지 직접 하도록 다시 요청합니다 (%d/3)" % nudges)
+                emit("notice", level="info", text="아직 끝나지 않아 모델이 직접 이어서 하도록 다시 요청합니다 (%d/3)" % nudges)
                 self.history.append({"role": "user", "content": (
                     "Do not hand the work back to me and do not ask me to run or change anything. You have tools on "
                     "this computer: do it yourself now — create/edit files with write_file / edit_file, run and check "
@@ -758,6 +788,12 @@ class Agent:
             for call in calls[:8]:
                 self.check_stop()
                 results.append(self._execute(call, readonly))
+            added = self._interjections()  # typed while working: added after these results, in order
+            if added:
+                results.append("\n".join("[The user added while you were working — include this, in order, after the "
+                                         "current step: %s]" % t for t in added))
+                for t in added:
+                    emit("user", text=t, interject=True)
             self.history.append({"role": "user", "content": "\n".join(results)})
         else:
             emit("notice", level="warn", text="작업 단계가 너무 많아 멈췄습니다 (%d단계). 이어서 하려면 '계속'이라고 입력하세요." % MAX_STEPS)
@@ -765,6 +801,8 @@ class Agent:
 
     def _execute(self, call: Dict, readonly: bool) -> str:
         name, args = call["name"], call["arguments"]
+        if name in ("write_file", "edit_file"):
+            self._wrote = getattr(self, "_wrote", 0) + 1
         self._n = getattr(self, "_n", 0) + 1
         cid = "t%d_%d" % (int(time.time()), self._n)
         title = tool_title(name, args)

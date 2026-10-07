@@ -89,13 +89,13 @@ def _watch(app, external: Optional["queue.Queue"], done: threading.Event, box: d
 
 def input_box(commands: Sequence[Tuple[str, str]], hints: Callable[[], List[Tuple[str, str]]],
               on_shift_tab: Optional[Callable[[], None]] = None,
-              external: Optional["queue.Queue"] = None) -> Tuple[str, str]:
+              external: Optional["queue.Queue"] = None, default: str = "") -> Tuple[str, str]:
     """Boxed multi-line input. Returns (source, text): source "key" or whatever the external item says."""
     global _history
     if _history is None:
         _history = InMemoryHistory()
     buf = Buffer(multiline=True, completer=_SlashCompleter(commands), complete_while_typing=True,
-                 history=_history)
+                 history=_history, document=Document(default, len(default)))
     kb = KeyBindings()
 
     @kb.add("enter")

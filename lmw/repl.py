@@ -592,7 +592,56 @@ class Shell:
         from .agent import Agent
         if self.agent is None:
             self.agent = Agent(self.cfg, self.root, self.client, self.ask_permission, self.perms, self.stop_event)
+        self.agent.interject = self._take_interjections
         return self.agent
+
+    def _take_interjections(self) -> List[str]:
+        """Prompts that arrived while a request runs: typed in the terminal or sent from the website."""
+        from . import keys
+        out = keys.KEYS.take() if (keys.KEYS is not None and not self.background) else []
+        if self.bridge:
+            inbox = self.bridge.channel(self.sid).inbox
+            keep = []
+            while True:
+                try:
+                    item = inbox.get_nowait()
+                except Exception:
+                    break
+                src, text = item if isinstance(item, tuple) else ("web", str(item))
+                if src in ("web", "key") and text.strip() and not text.startswith("\x00") and not text.strip().startswith("/"):
+                    out.append(text.strip())
+                    if src == "web":
+                        with ui.remote_muted():
+                            print(ui.dim("  ↳ 추가 요청 받음 (웹): ") + text.strip())
+                else:
+                    keep.append(item)
+            for item in keep:
+                inbox.put(item)
+        return out
+
+    def _start_keys(self):
+        """Typing while lmw works (terminal session only, when nothing else reads the keyboard)."""
+        from . import keys
+        if self.background or keys.KEYS is not None:
+            return None
+        if self.bridge and not getattr(self.bridge, "tui", False):
+            return None  # the bridge's line reader already takes typed lines
+        k = keys.KeyReader()
+        if not k.start():
+            return None
+        keys.KEYS = k
+        return k
+
+    def _stop_keys(self, k) -> None:
+        from . import keys
+        if k is None:
+            return
+        keys.KEYS = None
+        left = k.stop()
+        for t in k.take():  # typed after the last step: run next, in order
+            self.pending.append(t)
+        if left.strip():
+            ui.TUI["prefill"] = left  # unfinished line goes back into the input box
 
     def handle(self, text: str, route_override: Optional[str] = None, readonly: bool = False) -> None:
         """One user turn: route by effort, run, and report — like a chat app turn."""
@@ -618,6 +667,7 @@ class Shell:
         bind(self.usage)  # model calls made for this turn are billed to this session
         self.usage.begin_turn()
         retry = False
+        keyreader = self._start_keys()
         t0, tin, tout = time.time(), self.usage.prompt_tokens, self.usage.output_tokens
         try:
             if kind == "chat":
@@ -642,6 +692,7 @@ class Shell:
         except Exception as e:  # a failing turn must never close lmw
             emit("error", text="%s: %s" % (type(e).__name__, e))
         finally:
+            self._stop_keys(keyreader)
             self.usage.end_turn()
             try:
                 self.save_session()  # closed sessions can be continued later (/sessions, website)
@@ -717,8 +768,10 @@ class Shell:
             return None
 
         ch = self.bridge.channel(self.sid) if self.bridge else None
-        idx, src = tui.choose(lines, ["예", again, "아니요 (다르게 하라고 알려주기)"],
-                              external=getattr(ch, "inbox", None), accept_external=accept)
+        from . import keys
+        with keys.paused():
+            idx, src = tui.choose(lines, ["예", again, "아니요 (다르게 하라고 알려주기)"],
+                                  external=getattr(ch, "inbox", None), accept_external=accept)
         if idx < 0:
             idx = 2
         decision = decisions[idx]
