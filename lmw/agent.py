@@ -190,6 +190,39 @@ def shell_name() -> str:
     return windows_shell()[1] if os.name == "nt" else "sh"
 
 
+_MNT = re.compile(r"(?<![\w/])/mnt/([a-zA-Z])(?=/|\s|$|[\"'])")
+
+
+def fix_wsl_paths(text: str, git_bash: bool) -> str:
+    """Models often assume WSL: /mnt/c/Users/x -> /c/Users/x (Git Bash) or C:/Users/x (PowerShell)."""
+    return _MNT.sub(lambda m: "/%s" % m.group(1).lower() if git_bash else "%s:" % m.group(1).upper(), text)
+
+
+def environment_notes(root: Path, windows: Optional[bool] = None, git_bash: Optional[bool] = None) -> str:
+    """Plain facts about where the agent runs, so small models stop guessing (WSL, /mnt/c, Docker, …)."""
+    windows = (os.name == "nt") if windows is None else windows
+    lines = []
+    if windows:
+        gb = windows_shell()[1].startswith("bash") if git_bash is None else git_bash
+        lines.append("- You run natively on Windows — NOT in WSL, Linux or Docker. Never use /mnt/c, ~ or other Linux-only paths.")
+        if gb:
+            drive = str(root)
+            gpath = "/%s%s" % (drive[0].lower(), drive[2:].replace("\\", "/")) if len(drive) > 1 and drive[1] == ":" else drive
+            lines.append("- The bash tool is Git Bash and already starts in the project folder (%s). Use relative paths." % gpath)
+        else:
+            lines.append("- The bash tool is PowerShell and already starts in the project folder. Use relative paths and PowerShell syntax.")
+    else:
+        lines.append("- You run natively on %s. The bash tool already starts in the project folder: use relative paths."
+                     % platform.system().replace("Darwin", "macOS"))
+    lines.append("- Everything you create goes inside the project folder. To make a new folder, write a file inside it "
+                 "(write_file 'my-game/index.html' creates the folders). Don't move or copy things elsewhere unless asked.")
+    return "\n".join(lines)
+
+
+# the model thinks it is somewhere it is not
+_ENV_CONFUSED = re.compile(r"\bWSL\b|/mnt/[a-zA-Z]\b|리눅스\s*환경|Linux 환경|도커|docker", re.I)
+
+
 _WIN_HINT = ("\n[hint] This is Windows. Use the grep / glob / read_file / list_dir tools for searching and reading, "
              "and PowerShell syntax for commands (Select-String, Get-ChildItem, Get-Content). Fix the command and continue.")
 
@@ -205,6 +238,8 @@ class Tools:
         p = str(p or "").strip().strip('"').strip("'")
         if p in ("", ".", "./", ".\\"):
             return self.root
+        if os.name == "nt":
+            p = fix_wsl_paths(p, git_bash=False)  # /mnt/c/Users/x -> C:/Users/x
         q = Path(p).expanduser()
         if q.is_absolute():  # models often pass absolute paths; allow them inside the project only
             try:
@@ -342,6 +377,10 @@ class Tools:
         timeout = max(1, min(int(timeout or 120), 1800))
         try:
             if os.name == "nt":
+                git_bash = windows_shell()[1].startswith("bash")
+                fixed = fix_wsl_paths(command, git_bash)
+                if fixed != command:
+                    command, self._path_note = fixed, "[lmw] WSL-style /mnt/c/... paths were converted: this is native Windows."
                 argv = windows_shell()[0] + [command]
                 proc = subprocess.Popen(argv, cwd=str(self.root), stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -370,6 +409,10 @@ class Tools:
         if proc.returncode != 0 and os.name == "nt" and re.search(
                 r"not recognized|인식되지|CommandNotFound|command not found|is not recognized", text, re.I):
             text += _WIN_HINT  # e.g. grep in cmd: tell the model how to do it here instead of giving up
+        note = getattr(self, "_path_note", "")
+        if note:
+            self._path_note = ""
+            text = note + "\n" + (text or "")
         return proc.returncode == 0, "exit %d" % proc.returncode, text or "(no output)", {}
 
     searxng = ""  # optional SearXNG URL from the config
@@ -499,6 +542,7 @@ def parse_tool_calls(text: str) -> Tuple[List[Dict], str]:
 
 SYSTEM = """You are LMW, an expert coding agent working directly on the user's computer.
 Project folder: {cwd}   OS: {os}   Date: {date}
+{envnotes}
 
 You read, search and change files and run commands by calling tools. You CAN create, edit and delete files and
 run programs on this computer — never say you cannot; do the work with the tools instead of pasting code.
@@ -573,6 +617,7 @@ class Agent:
         if readonly:
             tools = "\n".join(l for l in tools.splitlines() if not l.startswith(("- write_file", "- edit_file", "- bash")))
         return SYSTEM.format(cwd=self.root, os="%s %s" % (platform.system(), platform.release()),
+                             envnotes=environment_notes(self.root),
                              date=time.strftime("%Y-%m-%d"), tools=tools,
                              language=self._lang(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
                              tree=tree, skills=skills)
@@ -801,7 +846,8 @@ class Agent:
                      or _INTENT.search(tail) or unfinished):
                 nudges += 1  # it has tools: make it do the work itself, to the end
                 emit("notice", level="info", text="아직 끝나지 않아 모델이 직접 이어서 하도록 다시 요청합니다 (%d/3)" % nudges)
-                self.history.append({"role": "user", "content": (
+                fix = ("You are NOT where you think: " + environment_notes(self.root) + "\n") if _ENV_CONFUSED.search(prose or "") else ""
+                self.history.append({"role": "user", "content": fix + (
                     "Do not hand the work back to me and do not ask me to run or change anything. You have tools on "
                     "this computer: do it yourself now — create/edit files with write_file / edit_file, run and check "
                     "with bash (fix failing commands, e.g. use the grep/glob tools or PowerShell on Windows). Continue "
