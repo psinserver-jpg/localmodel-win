@@ -39,14 +39,16 @@ def run_wizard(cfg: Config) -> bool:
     if i < 0:
         return False
     if i == len(servers):
-        url = ui.read_line("  서버 주소 (예: http://192.168.0.10:11434 또는 http://host:8000/v1) > ").strip()
-        if not url:
+        from . import connect
+        ui.info("다른 PC: 192.168.0.10 · 다른 포트: 192.168.0.10:1234 · 클라우드: openai / openrouter / https://…/v1")
+        text = ui.read_line("  서버 주소 > ").strip()
+        if not text:
             return False
-        cfg.base_url = url
-        cfg.provider = "openai" if "/v1" in url else "ollama"
-        key = ui.read_line("  API 키 (없으면 Enter) > ").strip()
-        if key:
-            cfg.api_key = key
+        ok, msg = connect.apply(cfg, text, ask_key=lambda: ui.read_line("  API 키 (붙여넣기) > "), log=lambda t: ui.info(ui.dim(t)))
+        if not ok:
+            ui.err(msg)
+            return False
+        ui.ok(msg)
     else:
         cfg.provider, cfg.base_url = servers[i].provider, servers[i].base_url
 

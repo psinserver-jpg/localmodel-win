@@ -365,6 +365,12 @@ class ChatClient:
         except Exception:
             pass
 
+    def reset_server(self) -> None:
+        """The server (or its address) changed: forget what was learned about the old one."""
+        self._compat = False
+        self._tools = None
+        self._ctx_cap = self._load_cap()
+
     def forget_cap(self) -> None:
         """`/context` set by hand: drop what was learned from crashes."""
         self._ctx_cap = 0

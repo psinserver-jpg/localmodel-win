@@ -38,6 +38,7 @@ if (-not $py) {
 
 # 2) Download (git if available, otherwise a zip — no git needed)
 New-Item -ItemType Directory -Force -Path $Dest, $Bin | Out-Null
+try { New-Item -ItemType Directory -Force -Path (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'lmw') | Out-Null } catch {}  # where lmw works when you do not pick a folder
 # $PSScriptRoot is empty when piped through `irm | iex`
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "lmw\__main__.py"))) {
     $App = $PSScriptRoot   # running from a cloned folder: use it in place

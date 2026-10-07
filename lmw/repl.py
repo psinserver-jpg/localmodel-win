@@ -56,6 +56,7 @@ COMMANDS = [
     ("/server", "모델 서버 변경 (LM Studio, vLLM, 다른 PC…)", "모델"),
     ("/setup", "처음 설정 다시 하기", "모델"),
     ("/ctx", "컨텍스트 크기 (/ctx 32768)", "모델"),
+    ("/memory", "계정에 저장된 긴 기억 (on / off / clear / 상태)", "모델"),
     ("/skills", "스킬 목록", "모델"),
     ("/skill", "스킬 항상 포함 토글 (/skill web-design)", "모델"),
     ("/auto", "파일 변경 자동 승인 켜기/끄기", "설정"),
@@ -170,6 +171,11 @@ class Shell:
         self.cfg = cfg
         self.auth = auth
         self.root = workspace.resolve()
+        from . import projects
+        self.base_mode = projects.is_unchosen(self.root)  # started outside any project: jobs get their own folder
+        if self.base_mode:
+            self.root = projects.ensure_base().resolve()
+        self.base_dir = self.root
         self.auto = False
         self.chat: List[Dict[str, str]] = []  # question-mode history
         self.done_tasks: List[str] = []  # earlier task requests this session
@@ -539,6 +545,22 @@ class Shell:
         elif cmd == "/models":
             for m in self.client.list_models():
                 print("   - " + m)
+        elif cmd == "/memory":
+            from . import memory
+            a = arg.strip().lower()
+            if a in ("on", "켜기", "켜"):
+                memory.enabled = True
+                ui.ok("기억 켜짐 — 대화를 계정에 저장하고 필요할 때 자동으로 불러옵니다")
+            elif a in ("off", "끄기", "꺼"):
+                memory.enabled = False
+                ui.ok("기억 꺼짐 (이미 저장된 것은 그대로, 지우려면 /memory clear)")
+            elif a in ("clear", "삭제", "지우기"):
+                n = memory.clear()
+                ui.ok("계정의 기억 %d개를 지웠습니다" % n) if n is not None else ui.warn("지우지 못했습니다 (로그인/연결 확인)")
+            else:
+                n = memory.count()
+                ui.info("기억: %s · 계정에 저장된 노트 %s개\n  /memory on · off · clear" % (
+                    "켜짐" if memory.enabled else "꺼짐", "?" if n is None else n))
         elif cmd == "/ctx":
             try:
                 n = int(arg)
@@ -686,9 +708,20 @@ class Shell:
         from .agent import Agent
         if self.agent is None:
             self.agent = Agent(self.cfg, self.root, self.client, self.ask_permission, self.perms, self.stop_event)
+        self.agent.auto_folder = self.base_mode and self.agent.root == self.base_dir
+        self.agent.on_retarget = self._retargeted
         self.agent.interject = self._take_interjections
         self.agent.ask_user_cb = self._ask_user
         return self.agent
+
+    def _retargeted(self, root: Path) -> None:
+        """The agent picked a job folder under ~/Documents/lmw: the session lives there from now on."""
+        self.root = root
+        if self.bridge:
+            try:
+                self.bridge.set_meta(sid=self.sid, cwd=str(root))
+            except Exception:
+                pass
 
     def _take_interjections(self) -> List[str]:
         """Prompts that arrived while a request runs: typed in the terminal or sent from the website."""
@@ -1025,6 +1058,8 @@ class Shell:
     def new_session(self) -> None:
         from .events import emit
         self.agent = None
+        if self.base_mode:
+            self.root = self.base_dir  # the next job gets a new folder
         self.chat.clear()
         self.done_tasks.clear()
         self.titled = False
@@ -1050,7 +1085,7 @@ class Shell:
             ui.warn("웹 새 세션을 만들지 못했습니다: %s" % e)
             return
         import copy
-        w = Shell(copy.copy(self.cfg), self.root, self.auth)  # own config + client: the web can switch its model
+        w = Shell(copy.copy(self.cfg), self.base_dir if self.base_mode else self.root, self.auth)  # own config + client: the web can switch its model
         w.bridge, w.sid, w.background = self.bridge, ch.sid, True
         w.client = copy.copy(self.client)  # same server settings, but this session's own model
         w.client.cfg = w.cfg
@@ -1301,18 +1336,29 @@ class Shell:
         return False
 
     def _server(self, arg: str) -> None:
-        """/server <url> [ollama|openai] — switch model server (e.g. another PC on the LAN)."""
-        if not arg:
-            ui.info("%s (%s)" % (self.cfg.base_url, self.cfg.provider))
-            ui.info("사용법: /server http://192.168.0.10:11434 ollama   |   /server http://localhost:1234/v1 openai")
+        """/server <address> — another PC, another port or a cloud OpenAI-compatible API, in one line."""
+        from . import connect
+        if not arg.strip():
+            ui.info("지금: %s (%s)" % (self.cfg.base_url, self.cfg.provider))
+            ui.info("바꾸려면 주소만 입력하세요 (Enter = 취소)")
+            for ex, what in (("192.168.0.10", "다른 PC (포트 자동 탐색)"), ("192.168.0.10:1234", "다른 PC의 특정 포트"),
+                             (":8000", "이 PC의 다른 포트"), ("lmstudio · vllm · ollama", "이름만"),
+                             ("openai · openrouter · groq …", "클라우드 (API 키만 물어봅니다)"),
+                             ("https://내주소/v1 [API키]", "그 밖의 OpenAI 호환 주소")):
+                print("     %-30s %s" % (ex, ui.dim(what)))
+            try:
+                arg = ui.read_line("  서버 > ").strip()
+            except EOFError:
+                return
+            if not arg:
+                return
+        ok, msg = connect.apply(self.cfg, arg, ask_key=lambda: ui.read_line("  API 키 (붙여넣기) > "), log=lambda t: ui.info(ui.dim(t)))
+        if not ok:
+            ui.err(msg)
             return
-        parts = arg.split()
-        self.cfg.base_url = parts[0]
-        if len(parts) > 1 and parts[1] in ("ollama", "openai"):
-            self.cfg.provider = parts[1]
-        elif parts[0].rstrip("/").endswith("/v1"):
-            self.cfg.provider = "openai"
-        ui.ok("server → %s (%s)" % (self.cfg.base_url, self.cfg.provider))
+        if hasattr(self.client, "reset_server"):
+            self.client.reset_server()
+        ui.ok("서버 → " + msg)
         self.pick_model()
 
     def _save_choice(self) -> None:

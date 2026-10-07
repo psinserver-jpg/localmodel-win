@@ -30,6 +30,7 @@ python3 -m pip install --user --quiet --disable-pip-version-check prompt_toolkit
   || python3 -m pip install --user --quiet --break-system-packages prompt_toolkit >/dev/null 2>&1 || true
 
 mkdir -p "$BIN"
+mkdir -p "$HOME/Documents/lmw" 2>/dev/null || true   # where lmw works when you do not pick a folder
 cat > "$BIN/lmw" <<WRAP
 #!/usr/bin/env sh
 PYTHONPATH="$APP\${PYTHONPATH:+:\$PYTHONPATH}" exec python3 -m lmw "\$@"

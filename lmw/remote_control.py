@@ -132,7 +132,7 @@ def whoami(auth: Dict[str, str]) -> Optional[str]:
                 return None
             err: OSError = OSError("서버 응답 HTTP %s%s" % (e.code, " (Hub 서버가 꺼져 있음)" if e.code in (502, 503, 504, 521, 522, 523) else ""))
         except ValueError:
-            err = OSError("Hub 가 아닌 응답 (주소 확인: lmw login → Hub 주소 변경)")
+            err = OSError("Hub 가 아닌 응답 (psin.ai.kr 주소가 고정입니다. 인터넷/프록시 확인)")
         except OSError as e:
             err = OSError(_net_reason(e))
         if attempt == 0:
@@ -166,13 +166,6 @@ def login(hub: str = "", open_browser: bool = True) -> Optional[Dict[str, str]]:
     if not hub.startswith(("http://", "https://")):
         hub = "http://" + hub
     ui.box("LMW 로그인", ["lmw 를 사용하려면 Google 계정으로 로그인해야 합니다.", "Hub: " + hub])
-    choice = ui.menu("로그인", [("Google 계정으로 로그인", "링크가 열리면 Google 로그인 → [로그인 승인하기]"),
-                              ("Hub 주소 변경", hub)], 0)
-    if choice == 1:
-        new = ui.read_line("  Hub 주소 > ").strip()
-        return login(new or hub, open_browser) if new else None
-    if choice != 0:
-        return None
     try:
         _, start = _req("POST", hub + "/api/device/start", {"device": _device_name()})
     except urllib.error.HTTPError as e:
@@ -180,7 +173,7 @@ def login(hub: str = "", open_browser: bool = True) -> Optional[Dict[str, str]]:
         return None
     except (urllib.error.URLError, OSError) as e:
         ui.err("Hub 에 연결할 수 없습니다: %s (%s)" % (hub, e))
-        ui.info("인터넷 연결과 Hub 주소를 확인하세요")
+        ui.info("인터넷 연결을 확인하세요")
         return None
     url = "%s/device?code=%s" % (hub, start["code"])
     print()

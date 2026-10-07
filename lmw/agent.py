@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import ui
-from .client import ChatClient, ContextRefit, ModelError
+from . import memory, projects
+from .client import ChatClient, ContextRefit, ModelError, strip_reasoning
 from .config import Config
 from .events import TOOL_LABELS, emit
 from . import agents as agentlib
@@ -665,6 +666,42 @@ class Agent:
         self.tools.ask_cb = lambda q: self.ask_user_cb(q) if self.ask_user_cb else None
         self.tools.agent_cb = lambda n, t: agentlib.run_sub(self, n, t)
 
+    # ---- default workspace: ~/Documents/lmw/<job name> when the user did not choose a folder
+    auto_folder = False  # set by the shell when lmw was started outside any project folder
+    on_retarget: Optional[Callable[[Path], None]] = None
+
+    def retarget(self, root: Path) -> None:
+        """Move this agent's workspace to another folder (its tools follow)."""
+        self.root = root.resolve()
+        self.tools.ws = Workspace(self.root)
+        self.tools.root = self.tools.ws.root
+        if self.on_retarget:
+            try:
+                self.on_retarget(self.root)
+            except Exception:
+                pass
+
+    def _name_job(self, request: str) -> str:
+        def ask(text: str) -> str:
+            res = self.client.chat(
+                [{"role": "system", "content": "Summarize the user's request as a folder name: 2 to 4 short words, "
+                                                "lowercase, joined with hyphens, no punctuation, no extension. In English "
+                                                "unless the request is in Korean. Reply with the name only."},
+                 {"role": "user", "content": text}], temperature=0.2, max_tokens=24, think=False)
+            return strip_reasoning(res.text).strip()
+        return projects.name_for(request, ask)
+
+    def _enter_job_folder(self, request: str) -> None:
+        if not self.auto_folder or self.sub:
+            return
+        self.auto_folder = False  # one folder per session: later requests continue there
+        try:
+            folder = projects.make_folder(self._name_job(request))
+        except OSError:
+            return
+        self.retarget(folder)
+        emit("notice", level="info", text="📁 작업 폴더: %s" % folder)
+
     def personas(self) -> Dict[str, "agentlib.Persona"]:
         if self._personas is None:
             try:
@@ -741,11 +778,13 @@ class Agent:
                              date=time.strftime("%Y-%m-%d"), tools=tools,
                              language=self._lang(user_text), effort=EFFORT_RULES.get(effort, EFFORT_RULES["medium"]),
                              tree=tree, skills=skills)
+        prompt += getattr(self, "_mem_block", "")
         return (agentlib.persona_prompt(self.persona) + "\n" + prompt) if self.persona else prompt
 
     # ------------------------------------------------------- auto-compaction
     _readonly = False
-    COMPACT_AT = 0.8  # summarize older messages when the conversation fills 80% of the context
+    COMPACT_AT = 0.6  # summarize older messages when the conversation fills 60% of the context (leaves room to think)
+    COMPACT_AT_DEEP = 0.45  # deep reasoning writes long thoughts: keep the history smaller so the model does not run out of memory
 
     def _history_tokens(self) -> int:
         return sum(estimate_tokens(m["content"]) for m in self.history)
@@ -768,9 +807,10 @@ class Agent:
         self.history.append({"role": "user", "content": "[The user added while you were working — handle this too, "
                                                         "in order, after what you were doing]\n" + t})
 
-    def maybe_compact(self, system: str) -> None:
+    def maybe_compact(self, system: str, effort: str = "medium") -> None:
         budget = self._budget() - estimate_tokens(system)
-        if self._history_tokens() > self.COMPACT_AT * budget and len(self.history) > 4:
+        at = self.COMPACT_AT_DEEP if effort == "high" else self.COMPACT_AT
+        if self._history_tokens() > at * budget and len(self.history) > 4:
             self.compact(budget)
 
     def compact(self, budget: Optional[int] = None, manual: bool = False) -> bool:
@@ -790,6 +830,7 @@ class Agent:
         head, tail = self.history[:keep], self.history[keep:]
         if not head:
             return False
+        memory.save_dropped(str(self.root), "", head)  # the originals stay on the account after they are summarized
         lines, room = [], int(budget * 0.6) * 3  # characters of transcript the summarizer may read
         for m in head:
             c = str(m["content"])
@@ -923,6 +964,9 @@ class Agent:
         self.reply_lang = self._lang(text)
         self._readonly = readonly
         nudges = 3 if self.sub else 0
+        if effort != "none" and not readonly:
+            self._enter_job_folder(text)  # no folder chosen: name one after the request and work there
+        self._mem_block = "" if self.sub else memory.prompt_block(text, str(self.root))  # relevant notes from earlier talks
         self._wrote = 0  # files created/changed in this request
         for t in self._interjections():  # typed before the first step: part of the request
             self._add_interjection(t)
@@ -931,7 +975,7 @@ class Agent:
         for step in range(self.max_steps):
             self.check_stop()
             system = self._system(text, effort, readonly)
-            self.maybe_compact(system)  # summarize old messages before the context overflows
+            self.maybe_compact(system, effort)  # summarize old messages before the context overflows
             t0 = time.time()
             try:
                 raw, finish = self._call(self._fit(system), lambda s: None, think=think, refit=True)
@@ -1000,6 +1044,8 @@ class Agent:
             self.history.append({"role": "user", "content": "\n".join(results)})
         else:
             emit("notice", level="warn", text="작업 단계가 너무 많아 멈췄습니다 (%d단계). 이어서 하려면 '계속'이라고 입력하세요." % self.max_steps)
+        if not self.sub:
+            memory.save_turn(str(self.root), "", text, final)  # remembered on the account, found again by itself
         return final
 
     def _execute(self, call: Dict, readonly: bool) -> str:
