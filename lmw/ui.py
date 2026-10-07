@@ -268,9 +268,67 @@ TUI = {"commands": [], "hints": lambda: [], "shift_tab": None, "choose_active": 
 
 def read_line(prompt: str = "", main: bool = False) -> str:
     """main=True: the big input box (lmw ❯). Otherwise a one-line question."""
+    cap = getattr(_tls, "capture", None)
+    if cap is not None:
+        cap.flush(waiting=True)  # a command asks something: show its output so far (e.g. a menu) on the website
+    reader = getattr(_tls, "reader", None)
+    if reader is not None and not main:  # sessions opened from the website answer from the website
+        return reader(prompt)
     from . import keys
     with keys.paused():  # typing-while-working pauses while a question owns the keyboard
         return _read_line(prompt, main)
+
+
+def set_thread_reader(fn) -> None:
+    """Questions asked in this thread (menus of /commands) are answered by fn(prompt) instead of the keyboard."""
+    _tls.reader = fn
+
+
+class _OutTee:
+    """stdout wrapper: also hands this thread's output to an active capture."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, s):
+        cap = getattr(_tls, "capture", None)
+        if cap is not None and s:
+            cap.parts.append(s)
+            if cap.silent:  # a website session's command: show it there only
+                return len(s)
+        return self._real.write(s)
+
+    def flush(self):
+        return self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class capture:
+    """with capture(on_flush): output printed by this thread is collected (to show a /command's result on the web)."""
+
+    def __init__(self, on_flush, silent: bool = False):
+        self.parts, self.on_flush, self.silent = [], on_flush, silent
+
+    def flush(self, waiting: bool = False) -> None:
+        text = _ANSI_RE.sub("", "".join(self.parts)).replace("\r", "")
+        self.parts = []
+        if text.strip():
+            try:
+                self.on_flush(text.rstrip(), waiting)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        if not isinstance(sys.stdout, _OutTee):
+            sys.stdout = _OutTee(sys.stdout)
+        _tls.capture = self
+        return self
+
+    def __exit__(self, *exc):
+        _tls.capture = None
+        self.flush()
 
 
 def _read_line(prompt: str = "", main: bool = False) -> str:

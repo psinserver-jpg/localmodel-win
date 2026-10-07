@@ -240,6 +240,7 @@ class Shell:
             self.bridge.on_new_session = self.open_web_session
             self.bridge.main.usage = self.usage
             self._publish_models()
+            self.bridge.set_meta(sid=self.sid, commands=[[c, d] for c, d, _ in COMMANDS])
             from . import __version__, updater
             self.bridge.set_meta(sid=self.sid, version=__version__, latest=updater.latest or "")
         except Exception as e:
@@ -342,7 +343,7 @@ class Shell:
                     break
             try:
                 if line.startswith("/"):
-                    if self._command(line) == "exit":
+                    if self.run_command(line) == "exit":
                         return 0
                 else:
                     self.handle(line)
@@ -421,6 +422,36 @@ class Shell:
         return t.endswith(("?", "？")) or (bool(QUESTION_START.match(t)) and len(t) < 200)
 
     # ------------------------------------------------------------- commands
+    WEB_SESSION_BLOCKED = ("/exit", "/quit", "/q", "/logout", "/update", "/setup", "/watch", "/web")
+
+    def run_command(self, line: str) -> Optional[str]:
+        """A /command typed in the terminal or sent from the website; its output is also shown on the website."""
+        from .events import emit
+        cmd = line.split()[0].lower()
+        if self.background and cmd in self.WEB_SESSION_BLOCKED:
+            emit("notice", level="warn", text="%s 는 컴퓨터의 터미널 세션에서만 쓸 수 있습니다" % cmd)
+            return None
+        if cmd == "/update" and self.background is False and self.bridge:
+            emit("command", text=line, output="lmw 를 업데이트하고 다시 시작합니다…")
+        if not self.bridge:
+            return self._command(line)
+        state = {"first": True}
+
+        def show(text: str, waiting: bool) -> None:
+            emit("command", text=line if state["first"] else "", output=text, waiting=waiting)
+            state["first"] = False
+        try:
+            with ui.capture(show, silent=self.background):
+                result = self._command(line)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            emit("error", text="%s 실패: %s" % (cmd, e))
+            return None
+        if state["first"]:  # nothing printed: still confirm on the website
+            emit("command", text=line, output="완료")
+        return result
+
     def _command(self, line: str) -> Optional[str]:
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
@@ -966,7 +997,8 @@ class Shell:
         ch.on_interrupt = w.stop_event.set
         ch.on_control = w._remote_control
         self.bridge.set_meta(sid=ch.sid, mode=w.perms.mode, effort=w.effort, model=w.cfg.model,
-                             models=getattr(self, "_models", None))
+                             models=getattr(self, "_models", None),
+                             commands=[[c, d] for c, d, _ in COMMANDS if c not in Shell.WEB_SESSION_BLOCKED])
         self.workers.append(w)
         with ui.remote_muted():
             print(ui.dim("\n⇢ [웹 세션] 웹에서 새 세션이 열렸습니다 (이 터미널은 그대로 사용하세요)"))
@@ -1003,6 +1035,7 @@ class Shell:
     def serve_channel(self, ch) -> None:
         from .events import set_context
         set_context(ch.sid, background=True)
+        ui.set_thread_reader(self.read)  # menus of /commands are answered from the website
         while not ch.closed:
             text = self.pending.pop(0) if self.pending else self.read("")
             if text == CTL_PREFIX + "close_session":
@@ -1012,10 +1045,8 @@ class Shell:
                 continue  # late permission clicks / controls with nothing waiting
             try:
                 if text.strip().startswith("/"):
-                    cmd = text.strip().split()[0]
-                    if cmd in ("/mode", "/effort") and len(text.split()) > 1:
-                        self._remote_control(cmd[1:], text.split()[1])
-                    continue  # other slash commands are terminal-only
+                    self.run_command(text.strip())
+                    continue
                 self.handle(text.strip())
             except Exception as e:  # never kill the worker thread
                 from .events import emit

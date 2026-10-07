@@ -153,8 +153,8 @@ def _phase_detail(d: str) -> str:
 def render(e: Event, verbose: bool = False) -> None:
     """Terminal rendering in the Claude Code style (details are also on the web)."""
     t = e["type"]
-    if t == "thinking_live":
-        return  # the spinner line shows "생각하는 중…"; the website shows the text live
+    if t in ("thinking_live", "command"):
+        return  # live thoughts: the spinner shows them; command output: already printed here  # the spinner line shows "생각하는 중…"; the website shows the text live
     if t == "thinking":
         secs = e.get("seconds")
         print(ui.dim("✻ 생각함" + (" (%.1f초)" % secs if isinstance(secs, (int, float)) and secs else "")))
